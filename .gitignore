@@ -1,0 +1,36 @@
+data/
+datasets/
+outputs/
+renders/
+features/
+checkpoints/
+*.pkl
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.wav
+*.jpeg
+*.jpg
+*.png
+*.mp4
+*.mov
+*.avi
+*.log
+camera_path.json
+# Nerfstudio / cache-ish
+wandb/
+*.glb
+*.ply
+
+# Python cruft
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+.venv/.git-credentials

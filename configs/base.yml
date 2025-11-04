@@ -1,0 +1,30 @@
+experiment: ReverbRAG_unified
+seed: 42
+
+run:
+  model: avnerf            # {neraf | avnerf}
+  database: raf           # {raf | soundspaces}
+  scene: FurnishedRoom     # {EmptyRoom | FurnishedRoom for RAF; LivingRoom | OfficeRoom for SoundSpaces}
+  reverbrag: true         # {true | false}
+
+wandb:
+  project: ReverbRAG
+  run_name: neraf_raf_test
+  api_key: null    # optional; set if you want auto-login, otherwise keep null
+
+databases:
+  raf:
+    root: ../NeRAF/data/RAF          # base folder for RAF
+  soundspaces:
+    root: /data/SoundSpaces                # base folder for SoundSpaces
+
+# Toggle ReverbRAG and set its options
+reverbrag:
+  k: 5                                     # top-K retrieved references
+  index_dir: /data/ReverbRAG/indices
+  ref_aggregation: scaled_dot              # {attn | film}
+  fusion: bahdanau                         # {add | attn | bahdanau}
+  gating: true                             # {true | false}
+
+loss:
+  edc: 0.2

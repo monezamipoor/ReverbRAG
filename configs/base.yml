@@ -6,6 +6,16 @@ run:
   database: raf           # {raf | soundspaces}
   scene: FurnishedRoom     # {EmptyRoom | FurnishedRoom for RAF; LivingRoom | OfficeRoom for SoundSpaces}
   reverbrag: true         # {true | false}
+  sample_rate: 48000
+
+sampler:
+  dataset_mode: slice      # {full | slice}
+  batching: edc_full       # {random | edc_full}
+  batch_size: 40            # if edc_full: 4 RIRs -> 4*60 slices per batch
+  shuffle: true
+  num_workers: 4
+  cache_capacity: 8        # per-worker SIDs kept hot (LRU)
+
 
 wandb:
   project: ReverbRAG

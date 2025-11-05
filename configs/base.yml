@@ -10,8 +10,8 @@ run:
 
 sampler:
   dataset_mode: slice      # {full | slice}
-  batching: edc_full       # {random | edc_full}
-  batch_size: 40            # if edc_full: 4 RIRs -> 4*60 slices per batch
+  batching: random       # {random | edc_full}
+  batch_size: 32            # if edc_full: 4 RIRs -> 4*60 slices per batch
   shuffle: true
   num_workers: 4
   cache_capacity: 8        # per-worker SIDs kept hot (LRU)

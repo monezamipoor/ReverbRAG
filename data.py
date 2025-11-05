@@ -141,9 +141,7 @@ class RAFDataset(Dataset):
         quat = np.array(vals[:4], dtype=np.float32)
         tx   = torch.tensor(vals[4:], dtype=torch.float32)
         orientation = _orientation_from_quat_xyzW(quat)
-        rx_n = SceneBox.get_normalized_positions(rx, self.scene_box.aabb)
-        tx_n = SceneBox.get_normalized_positions(tx, self.scene_box.aabb)
-        return rx_n, tx_n, orientation
+        return rx, tx, orientation
 
     def _load_wav(self, sid: str):
         wav, sr = torchaudio.load(os.path.join(self.data_dir, sid, "rir.wav"))  # [1, T]
@@ -204,13 +202,13 @@ class RAFDataset(Dataset):
     def __getitem__(self, index: int) -> Dict[str, Any]:
         if self.dataset_mode == "full":
             sid = self.ids[index]
-            rx_n, tx_n, orientation = self._load_positions_and_ori(sid)
+            rx, tx, orientation = self._load_positions_and_ori(sid)
             wav_full, stft_full = self._cache_get_full(sid)  # <-- cached
             frgb, fdep = self._av_feats(sid)
             return {
                 "id": sid,
-                "receiver_pos": rx_n,
-                "source_pos": tx_n,
+                "receiver_pos": rx,
+                "source_pos": tx,
                 "orientation": orientation,
                 "wav": wav_full,      # [1, T]
                 "stft": stft_full,    # [1, F, 60]
@@ -221,15 +219,15 @@ class RAFDataset(Dataset):
         # slice mode
         sid_idx, t = self._lin2pair[index]
         sid = self.ids[sid_idx]
-        rx_n, tx_n, orientation = self._load_positions_and_ori(sid)
+        rx, tx, orientation = self._load_positions_and_ori(sid)
         wav_full, stft_full = self._cache_get_full(sid)      # <-- cached
         wav_slice = self._slice_from_wav(wav_full, t)        # [1, win’]
         stft_slice = stft_full[:, :, t]                      # [1, F]
         frgb, fdep = self._av_feats(sid)
         return {
             "id": sid,
-            "receiver_pos": rx_n,
-            "source_pos": tx_n,
+            "receiver_pos": rx,
+            "source_pos": tx,
             "orientation": orientation,
             "slice_t": t,
             "wav_slice": wav_slice,      # [1, win’]

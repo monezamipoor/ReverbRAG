@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nerfstudio.field_components.encodings import NeRFEncoding, SHEncoding  # exact libs used in your NeRAF code
+from nerfstudio.data.scene_box import SceneBox
 
 
 # -----------------------
@@ -26,6 +27,8 @@ class ModelConfig:
     scene_name: str = "FurnishedRoom"
     sample_rate: int = 48000  # 48000 -> 513, 16000 -> 257
     W_field: int = 1024       # width after trunk (same symbol W as in your NeRAF code)
+    scene_aabb: torch.Tensor = torch.tensor([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]])  # [2,3] scene AABB
+    
 
 
 def fs_to_stft_params(fs: int) -> Dict[str, int]:
@@ -82,18 +85,28 @@ class NeRAFEncoder(nn.Module):
         mic_xyz: torch.Tensor,    # [B,3]
         src_xyz: torch.Tensor,    # [B,3]
         head_dir: torch.Tensor,   # [B,3] direction vector or rotation representation
-        t_norm: torch.Tensor,     # [B,T,1] in [0,1]
-        visual_feat: torch.Tensor # [B,1024]
+        t_idx: torch.Tensor,     # [B,T,1] in [0,1]
+        visual_feat: torch.Tensor, # [B,1024]
+        aabb: torch.Tensor        # [2,3] scene AABB
     ) -> torch.Tensor:
         """
         Returns:
             W-token per time step: [B, T, W]
         """
-        B, T, _ = t_norm.shape
-
+        B, T, _ = t_idx.shape
+        if T > 1:
+            # full sequence: scale by (T-1)
+            t_norm = (t_idx.float() / float(T - 1)).clamp(0.0, 1.0)
+        else:
+            # slice mode: scale by (max_frames-1) to match full
+            t_norm = (t_idx.float() / 59.0).clamp(0.0, 1.0)
+        
+        # t_unit = (t_norm.float() / (t_norm.shape[1] - 1)).clamp(0.0, 1.0)
+        mic_n = SceneBox.get_normalized_positions(mic_xyz, aabb)
+        src_n = SceneBox.get_normalized_positions(src_xyz, aabb)
         # Encode static terms once per batch element
-        mic_e = self.position_encoding(mic_xyz)      # [B, d_pos]
-        src_e = self.position_encoding(src_xyz)      # [B, d_pos]
+        mic_e = self.position_encoding(mic_n)      # [B, d_pos]
+        src_e = self.position_encoding(src_n)      # [B, d_pos]
         rot_e = self.rot_encoding(head_dir)          # [B, d_rot]
         # Visual features are used as-is
         vis_e = visual_feat                           # [B, 1024]
@@ -166,6 +179,9 @@ class UnifiedReverbRAGModel(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
+        aabb = getattr(cfg, "scene_aabb", None)
+        aabb = aabb.clone().detach().float()
+        self.register_buffer("aabb", aabb)
 
         # Channels by database
         if cfg.database.lower() == "raf":
@@ -194,9 +210,9 @@ class UnifiedReverbRAGModel(nn.Module):
         mic_xyz: torch.Tensor,    # [B,3]
         src_xyz: torch.Tensor,    # [B,3]
         head_dir: torch.Tensor,   # [B,3]
-        t_norm: torch.Tensor,     # [B,T,1]
-        visual_feat: torch.Tensor # [B,1024]
+        t_idx: torch.Tensor,     # [B,T,1]
+        visual_feat: torch.Tensor, # [B,1024]
     ) -> torch.Tensor:
-        w = self.encoder(mic_xyz, src_xyz, head_dir, t_norm, visual_feat)  # [B, T, W]
+        w = self.encoder(mic_xyz, src_xyz, head_dir, t_idx, visual_feat, self.aabb)  # [B, T, W]
         stft = self.decoder(w)                                             # [B, C, F, T]
         return stft

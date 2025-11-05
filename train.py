@@ -1,7 +1,11 @@
 # train.py
-# Dataset-backed smoke test for Unified ReverbRAG NVAS model
-# Works for both dataset_mode = {full | slice}.
-# In slice mode, we now feed ONLY the requested slice (T=1 per item).
+# Dataset-backed smoke test for Unified ReverbRAG model.
+# - Builds the real RAF dataset and a DataLoader using your samplers.
+# - Pulls ONE batch and runs a forward pass (no training).
+# - Abstracts model choice from YAML: run.model = {neraf | avnerf}
+#
+# Usage:
+#   python train.py --config configs/base.yml
 
 import argparse
 import os
@@ -29,7 +33,7 @@ def load_global_feat(root: str, scene: str, device: torch.device) -> torch.Tenso
 
 
 def _worker_init_fn(_):
-    # Ensure each worker starts with a fresh, small LRU cache (dataset._cache)
+    # Ensure each worker starts with a fresh, small LRU cache in RAFDataset
     info = get_worker_info()
     if info is not None:
         ds = info.dataset
@@ -62,7 +66,7 @@ def build_loader(cfg, dataset):
             drop_last=False,
         ), dataset_mode
 
-    # slice mode → use our custom batch samplers
+    # slice mode → use custom batch samplers
     if batching == "random":
         batch_sampler = RandomSliceBatchSampler(len(dataset), batch_size=bs, drop_last=False, shuffle=shuffle)
     elif batching == "edc_full":
@@ -118,7 +122,7 @@ def main():
     dataset = build_dataset(cfg, split="train")
     loader, dataset_mode = build_loader(cfg, dataset)
 
-    # Build model
+    # Build model (abstracted by baseline)
     mcfg = ModelConfig(
         baseline=baseline,
         database=database,
@@ -130,39 +134,45 @@ def main():
     )
     model = UnifiedReverbRAGModel(mcfg).to(device).eval()
 
-    # Visual feature (global)
-    vis_1x = load_global_feat(root, scene, device)  # [1,1024]
-
-    # === pull one real batch ===
+    # --- pull one real batch ---
     batch = next(iter(loader))
 
-    # Common inputs
+    # Common pose inputs
     mic_xyz = batch["receiver_pos"].to(device).float()   # [B,3]
     src_xyz = batch["source_pos"].to(device).float()     # [B,3]
     head_dir = batch["orientation"].to(device).float()   # [B,3]
+    stft = batch["stft"].to(device).float()            # [B,C,F,T]
     B = mic_xyz.shape[0]
     C = 1 if database == "raf" else 2
 
-    # Time argument to model:
+    # Time argument to model (raw indices; model will normalize)
     if dataset_mode == "full":
         T = int(dataset.max_frames)  # 60
-        t_norm = torch.arange(T, device=device, dtype=torch.float32).view(1, T, 1).expand(B, T, 1)  # [B,T,1] = 0..T-1
+        t_idx = torch.arange(T, device=device, dtype=torch.float32).view(1, T, 1).expand(B, T, 1)  # [B,T,1] = 0..T-1
     else:
         slice_t = batch["slice_t"].to(device).long().view(B, 1, 1)  # [B,1,1]
         T = 1
-        t_norm = slice_t.float()                                    # raw index, model will scale
+        t_idx = slice_t.float()                                     # raw index, model scales
 
+    # Visual features:
+    # - NeRAF mode: use global 1024-D features (as before).
+    # - AV-NeRF mode: prefer per-pose features if present; fallback to global.pt.
+    if baseline == "avnerf":
+        # try per-pose RGB and/or depth vectors
+        feats = [batch.get(k, None) for k in ("feat_rgb", "feat_depth")]
+        visual_feat = torch.cat(
+            [f.to(device).float() for f in feats],dim=-1)
+    else:
+        vis_1x = load_global_feat(root, scene, device)  # [1,1024]
+        visual_feat = vis_1x.expand(B, -1).contiguous()  # [B,1024]
 
-    # Visual features per item
-    visual_feat = vis_1x.expand(B, -1).contiguous()  # [B,1024]
-
-    # ---- Forward
+    # ---- Forward (no grad; smoke test only)
     with torch.no_grad():
         out = model(
             mic_xyz=mic_xyz,
             src_xyz=src_xyz,
             head_dir=head_dir,
-            t_idx=t_norm,           # [B,T,1] with T=60 or T=1
+            t_idx=t_idx,            # [B,T,1] (0..T-1); model handles normalization
             visual_feat=visual_feat,
         )
 
@@ -184,9 +194,9 @@ def main():
         print(f"Batch size   : {B} items")
 
     print(f"Input shapes : mic={tuple(mic_xyz.shape)}, src={tuple(src_xyz.shape)}, "
-          f"head={tuple(head_dir.shape)}, t_norm={tuple(t_norm.shape)}, visual={tuple(visual_feat.shape)}")
+          f"head={tuple(head_dir.shape)}, t_idx={tuple(t_idx.shape)}, visual={tuple(visual_feat.shape)}")
     print(f"Output shape : {tuple(out.shape)}   (expect [B={B}, C={C}, F, T={T}])")
-
+    print(f"stft shape   : {tuple(stft.shape)}")
     assert out.ndim == 4 and out.shape[-1] == T and out.shape[1] == C, "Output shape mismatch"
     print("OK ✅")
 

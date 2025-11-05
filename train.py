@@ -1,110 +1,115 @@
 # train.py
-import argparse, yaml
-from pprint import pprint
+# Minimal smoke-test runner for Unified ReverbRAG NVAS model
+# Usage:
+#   python train.py --config configs/base.yml
+#
+# Reads YAML, loads {root}/{scene}/feats/global.pt (1024-D), builds model,
+# creates a synthetic batch matching your loader shapes, runs forward pass,
+# and prints the resulting tensor sizes.
+
+import argparse
+import os
+import yaml
 import torch
-from torch.utils.data import DataLoader, get_worker_info
-from data import build_dataset
-from dataloader import RandomSliceBatchSampler, EDCFullBatchSampler
 
-def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=str, required=True)
-    ap.add_argument("--split", type=str, default="train", choices=["train","valid","test","reference"])
-    return ap.parse_args()
+from model import UnifiedReverbRAGModel, ModelConfig
 
-def _worker_init_fn(worker_id):
-    # Ensure each worker starts with a fresh, small LRU cache
-    info = get_worker_info()
-    ds = info.dataset  # this worker's dataset copy
-    # Reset cache structures (already created in __init__, but ensure clean)
-    try:
-        ds._cache.clear()
-    except Exception:
-        ds._cache = OrderedDict()  # fallback if needed
+
+def load_global_feat(root: str, scene: str, device: torch.device) -> torch.Tensor:
+    feat_path = os.path.join(root, scene, "feats", "global.pt")
+    if not os.path.isfile(feat_path):
+        raise FileNotFoundError(f"Could not find visual features at: {feat_path}")
+    feat = torch.load(feat_path, map_location=device)
+    if isinstance(feat, dict) and "feat" in feat:
+        feat = feat["feat"]
+    feat = feat.float()
+    if feat.ndim == 1:
+        feat = feat.unsqueeze(0)  # [1,1024]
+    return feat  # [1,1024] or [B,1024] if pre-batched
+
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True)
+    args = parser.parse_args()
+
     with open(args.config, "r") as f:
-        opt = yaml.safe_load(f)
+        cfg_yaml = yaml.safe_load(f)
 
-    ds = build_dataset(opt, split=args.split)
+    run = cfg_yaml.get("run", {})
+    dbs = cfg_yaml.get("databases", {})
 
-    sampler_cfg = opt.get("sampler", {})
-    dataset_mode = sampler_cfg.get("dataset_mode", "full")
-    batching = sampler_cfg.get("batching", "random")
-    bs = int(sampler_cfg.get("batch_size", 4))
-    shuffle = bool(sampler_cfg.get("shuffle", True))
-    num_workers = int(sampler_cfg.get("num_workers", 4))
+    baseline = run.get("model", "neraf").lower()      # "neraf" | "avnerf"
+    database = run.get("database", "raf").lower()     # "raf" | "soundspaces"
+    scene = run.get("scene", "FurnishedRoom")
+    sample_rate = int(run.get("sample_rate", 48000))
 
-    # Build DataLoader with persistent workers to keep caches warm
-    if dataset_mode == "full":
-        if batching == "edc_full":
-            raise ValueError("edc_full batching requires dataset_mode='slice'.")
-        dl = DataLoader(
-            ds, batch_size=bs, shuffle=shuffle, num_workers=num_workers,
-            pin_memory=True, persistent_workers=(num_workers > 0),
-            worker_init_fn=_worker_init_fn,
-        )
+    # Resolve database root
+    if database == "raf":
+        root = dbs["raf"]["root"]
+    elif database == "soundspaces":
+        root = dbs["soundspaces"]["root"]
     else:
-        if batching == "random":
-            batch_sampler = RandomSliceBatchSampler(len(ds), batch_size=bs, drop_last=False, shuffle=shuffle)
-        elif batching == "edc_full":
-            batch_sampler = EDCFullBatchSampler(ids=ds.ids, max_frames=ds.max_frames,
-                                                batch_size_rirs=bs, drop_last=False, shuffle=shuffle)
-        else:
-            raise ValueError(f"Unknown batching mode '{batching}'")
-        dl = DataLoader(
-            ds, batch_sampler=batch_sampler, num_workers=num_workers,
-            pin_memory=True, persistent_workers=(num_workers > 0),
-            worker_init_fn=_worker_init_fn,
-        )
+        raise ValueError(f"Unknown database {database}")
 
-    print("\n=== Sanity check (caching on) ===")
-    print(f"Split: {args.split}, N_items={len(ds)}, mode={dataset_mode}, batching={batching}, batch_size={bs}")
-    batch = next(iter(dl))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def shape(x):
-        if x is None: return None
-        if isinstance(x, torch.Tensor): return tuple(x.shape)
-        return f"type={type(x)}"
+    # Build model config and model
+    mcfg = ModelConfig(
+        baseline=baseline,
+        database=database,
+        scene_root=root,
+        scene_name=scene,
+        sample_rate=sample_rate,
+        W_field=1024,  # matches your NeRAF field width symbol W
+    )
+    model = UnifiedReverbRAGModel(mcfg).to(device)
+    model.eval()
 
-    if dataset_mode == "full":
-        # Replace the "summary" section inside the `if dataset_mode == "full":` branch:
+    # Load mandatory visual feature (global.pt, 1024-D)
+    vis_1x = load_global_feat(root, scene, device)  # [1,1024]
 
-        summary = {
-            "batch_size": len(batch["id"]),
-            "ids": batch["id"],                         # show all ids
-            "receiver_pos": shape(batch["receiver_pos"]),  # (B, 3)
-            "source_pos":   shape(batch["source_pos"]),    # (B, 3)
-            "orientation":  shape(batch["orientation"]),   # (B, 3)
-            "wav":          shape(batch["wav"]),           # (B, 1, T)
-            "stft":         shape(batch["stft"]),          # (B, 1, 513, 60)
-            "feat_rgb":     shape(batch.get("feat_rgb", None)),
-            "feat_depth":   shape(batch.get("feat_depth", None)),
-        }
-        
-        B = min(2, len(batch["id"]))
-        for i in range(B):
-            print(f"\n--- FULL Sample {i} ({batch['id'][i]}) ---")
-            print("receiver_pos:", batch["receiver_pos"][i].tolist())
-            print("source_pos  :", batch["source_pos"][i].tolist())
-            print("orientation :", batch["orientation"][i].tolist())
-            print("wav shape   :", tuple(batch["wav"][i].shape))
-            print("stft shape  :", tuple(batch["stft"][i].shape))
-            if "feat_rgb" in batch:
-                print("feat_rgb   :", tuple(batch["feat_rgb"][i].shape))
-                print("feat_depth :", tuple(batch["feat_depth"][i].shape))
-
-
+    # Create a small synthetic batch compatible with your loader shapes
+    # From your notes: RAF slice mode often uses T=60
+    T = 60
+    if database == "raf":
+        C = 1
     else:
-        summary = {
-            "id": batch["id"][:6],
-            "slice_t": list(map(int, batch["slice_t"][:6])),
-            "wav_slice": shape(batch["wav_slice"]),   # (B, 1, win’)
-            "stft_slice": shape(batch["stft_slice"]), # (B, 1, F)
-        }
-    pprint(summary)
-    print("\nOK. Loader + cache wiring looks good.")
+        C = 2
+
+    B = int(cfg_yaml.get("sampler", {}).get("batch_size", 4))
+    B = max(1, min(B, 8))  # keep test small
+
+    # Inputs
+    mic_xyz = torch.rand(B, 3, device=device) * 2 - 1         # [-1,1]
+    src_xyz = torch.rand(B, 3, device=device) * 2 - 1
+    head_dir = torch.randn(B, 3, device=device)
+    head_dir = head_dir / (head_dir.norm(dim=-1, keepdim=True) + 1e-8)
+
+    t_norm = torch.linspace(0, 1, steps=T, device=device).view(1, T, 1).expand(B, T, 1)
+    visual_feat = vis_1x.expand(B, -1).contiguous()           # [B,1024]
+
+    # Forward
+    with torch.no_grad():
+        out = model(mic_xyz=mic_xyz,
+                    src_xyz=src_xyz,
+                    head_dir=head_dir,
+                    t_norm=t_norm,
+                    visual_feat=visual_feat)
+
+    # Expect [B, C, F, T]
+    print("==== Smoke Test ====")
+    print(f"Baseline     : {baseline}")
+    print(f"Database     : {database}")
+    print(f"Scene        : {scene}")
+    print(f"Sample rate  : {sample_rate}")
+    print(f"Input shapes : mic={tuple(mic_xyz.shape)}, src={tuple(src_xyz.shape)}, head={tuple(head_dir.shape)}, t_norm={tuple(t_norm.shape)}, visual={tuple(visual_feat.shape)}")
+    print(f"Output shape : {tuple(out.shape)}   (expect [B={B}, C={C}, F, T={T}])")
+
+    # A couple of cheap assertions
+    assert out.ndim == 4 and out.shape[0] == B and out.shape[-1] == T and out.shape[1] == C, "Output shape mismatch"
+    print("OK ✅")
+
 
 if __name__ == "__main__":
     main()

@@ -2,7 +2,7 @@ experiment: ReverbRAG_unified
 seed: 42
 
 run:
-  model: avnerf            # {neraf | avnerf}
+  model: neraf            # {neraf | avnerf}
   database: raf           # {raf | soundspaces}
   scene: FurnishedRoom     # {EmptyRoom | FurnishedRoom for RAF; LivingRoom | OfficeRoom for SoundSpaces}
   reverbrag: true         # {true | false}

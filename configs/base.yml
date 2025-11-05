@@ -1,5 +1,9 @@
-experiment: ReverbRAG_unified
 seed: 42
+
+wandb:
+  project: ReverbRAG
+  run_name: neraf_raf_test
+  api_key: null    # optional; set if you want auto-login, otherwise keep null
 
 run:
   model: avnerf            # {neraf | avnerf}
@@ -15,12 +19,6 @@ sampler:
   shuffle: true
   num_workers: 4
   cache_capacity: 8        # per-worker SIDs kept hot (LRU)
-
-
-wandb:
-  project: ReverbRAG
-  run_name: neraf_raf_test
-  api_key: null    # optional; set if you want auto-login, otherwise keep null
 
 databases:
   raf:

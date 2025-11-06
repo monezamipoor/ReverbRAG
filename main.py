@@ -1,94 +1,100 @@
-# train.py
-# Dataset-backed smoke test for Unified ReverbRAG model.
-# - Builds the real RAF dataset and a DataLoader using your samplers.
-# - Pulls ONE batch and runs a forward pass (no training).
-# - Abstracts model choice from YAML: run.model = {neraf | avnerf}
-#
-# Usage:
-#   python train.py --config configs/base.yml
-
-import argparse
+# main.py
 import os
+import argparse
+import copy
 import yaml
+import random
+import numpy as np
+from typing import Dict, Any
+
 import torch
 from torch.utils.data import DataLoader, get_worker_info
-from collections import OrderedDict
+from tqdm.auto import tqdm
 
-from model import UnifiedReverbRAGModel, ModelConfig
+# local
 from data import build_dataset
 from dataloader import RandomSliceBatchSampler, EDCFullBatchSampler
+from model import UnifiedReverbRAGModel, ModelConfig
+from trainer import Trainer, fs_to_stft_params
 
-
-def load_global_feat(root: str, scene: str, device: torch.device) -> torch.Tensor:
-    feat_path = os.path.join(root, scene, "feats", "global.pt")
-    if not os.path.isfile(feat_path):
-        raise FileNotFoundError(f"Could not find visual features at: {feat_path}")
-    feat = torch.load(feat_path, map_location=device)
-    if isinstance(feat, dict) and "feat" in feat:
-        feat = feat["feat"]
-    feat = feat.float()
-    if feat.ndim == 1:
-        feat = feat.unsqueeze(0)  # [1,1024]
-    return feat  # [1,1024] or [B,1024]
-
+# --------- small utils ----------
+def set_seed(seed: int):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def _worker_init_fn(_):
-    # Ensure each worker starts with a fresh, small LRU cache in RAFDataset
+    # reset per-worker dataset cache if present
     info = get_worker_info()
-    if info is not None:
-        ds = info.dataset
-        try:
-            ds._cache.clear()
-        except Exception:
-            ds._cache = OrderedDict()
+    if info is not None and hasattr(info.dataset, "_cache"):
+        try: info.dataset._cache.clear()
+        except Exception: info.dataset._cache = {}
 
+def _build_loader(cfg: Dict[str, Any], dataset, force_full: bool = False):
+    sc = copy.deepcopy(cfg.get("sampler", {}))
+    if force_full:
+        sc["dataset_mode"] = "full"
+        sc["batching"] = "random"
 
-def build_loader(cfg, dataset):
-    sampler_cfg = cfg.get("sampler", {})
-    dataset_mode = sampler_cfg.get("dataset_mode", "full").lower()
-    batching = sampler_cfg.get("batching", "random").lower()
-    bs = int(sampler_cfg.get("batch_size", 4))
-    shuffle = bool(sampler_cfg.get("shuffle", True))
-    num_workers = int(sampler_cfg.get("num_workers", 0))
+    dataset_mode = sc.get("dataset_mode", "full").lower()
+    batching = sc.get("batching", "random").lower()
+    bs = int(sc.get("batch_size", 4))
+    shuffle = bool(sc.get("shuffle", True))
+    num_workers = int(sc.get("num_workers", 0))
     use_persist = num_workers > 0
 
     if dataset_mode == "full":
         if batching == "edc_full":
             raise ValueError("edc_full batching requires dataset_mode='slice'.")
-        return DataLoader(
-            dataset,
-            batch_size=bs,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=use_persist,
-            worker_init_fn=_worker_init_fn,
+        loader = DataLoader(
+            dataset, batch_size=bs, shuffle=shuffle, num_workers=num_workers,
+            pin_memory=True, persistent_workers=use_persist, worker_init_fn=_worker_init_fn,
             drop_last=False,
-        ), dataset_mode
+        )
+        return loader, dataset_mode
 
-    # slice mode → use custom batch samplers
+    # slice mode with custom samplers
     if batching == "random":
         batch_sampler = RandomSliceBatchSampler(len(dataset), batch_size=bs, drop_last=False, shuffle=shuffle)
     elif batching == "edc_full":
         batch_sampler = EDCFullBatchSampler(
-            ids=dataset.ids,
-            max_frames=dataset.max_frames,
-            batch_size_rirs=bs,   # counts RIRs; effective elements = bs * T
-            drop_last=False,
-            shuffle=shuffle,
+            ids=dataset.ids, max_frames=dataset.max_frames,
+            batch_size_rirs=bs, drop_last=False, shuffle=shuffle
         )
     else:
         raise ValueError(f"Unknown batching mode '{batching}'")
 
     loader = DataLoader(
-        dataset,
-        batch_sampler=batch_sampler,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=use_persist,
-        worker_init_fn=_worker_init_fn,
+        dataset, batch_sampler=batch_sampler, num_workers=num_workers,
+        pin_memory=True, persistent_workers=use_persist, worker_init_fn=_worker_init_fn,
     )
     return loader, dataset_mode
+
+def build_visual_feat_builder(baseline: str):
+    """
+    Returns a callable batch->visual_feat:
+      - AV-NeRF: concat per-pose features if present (feat_rgb, feat_depth).
+      - NeRAF  : use global 1024-D; dataset already expands to per-item in RAFDataset.
+                 We simply fall back to (1x1024)->repeat if needed.
+    """
+    def _builder(batch, B):
+        if baseline == "avnerf":
+            feats = []
+            if "feat_rgb" in batch and batch["feat_rgb"].numel() > 0: feats.append(batch["feat_rgb"])
+            if "feat_depth" in batch and batch["feat_depth"].numel() > 0: feats.append(batch["feat_depth"])
+            if len(feats) == 0:
+                # fallback: zeros if per-pose features are absent
+                return torch.zeros(B, 0)
+            return torch.cat(feats, dim=-1)
+        # NeRAF (global 1024 already expanded in dataset build or cached per sid)
+        # If your dataset returns nothing, just zeros(1024).
+        f = batch.get("feat_rgb", None)  # RAFDataset does not provide global.pt here
+        if f is None or f.numel() == 0:
+            return torch.zeros(B, 1024)
+        return f
+    return _builder
+# ---------------------------------
 
 
 def main():
@@ -99,16 +105,20 @@ def main():
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
 
+    # Seed
+    seed = int(cfg.get("seed", 42))
+    set_seed(seed)
+
+    # Run config
     run = cfg.get("run", {})
-    dbs = cfg.get("databases", {})
-    sampler_cfg = cfg.get("sampler", {})
-
-    baseline = run.get("model", "neraf").lower()      # "neraf" | "avnerf"
-    database = run.get("database", "raf").lower()     # "raf" | "soundspaces"
+    baseline = run.get("model", "neraf").lower()          # {neraf|avnerf}
+    database = run.get("database", "raf").lower()         # {raf|soundspaces}
     scene = run.get("scene", "FurnishedRoom")
-    sample_rate = int(run.get("sample_rate", 48000))
+    fs = int(run.get("sample_rate", 48000))
+    epochs = int(run.get("epochs", 20))
 
-    # Resolve dataset root
+    # Databases roots
+    dbs = cfg.get("databases", {})
     if database == "raf":
         root = dbs["raf"]["root"]
     elif database == "soundspaces":
@@ -118,87 +128,58 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Build dataset + dataloader
-    dataset = build_dataset(cfg, split="train")
-    loader, dataset_mode = build_loader(cfg, dataset)
+    # --------- Build datasets/loaders ----------
+    train_ds = build_dataset(cfg, split="train")
+    train_loader, dataset_mode = _build_loader(cfg, train_ds, force_full=False)
 
-    # Build model (abstracted by baseline)
+    # Val: force dataset_mode='full' as requested
+    val_cfg = copy.deepcopy(cfg)
+    val_cfg.setdefault("sampler", {})
+    val_cfg["sampler"]["dataset_mode"] = "full"
+    val_ds = build_dataset(val_cfg, split="validation")
+    val_loader, _ = _build_loader(val_cfg, val_ds, force_full=True)
+
+    # --------- Build model ----------
     mcfg = ModelConfig(
-        baseline=baseline,
-        database=database,
-        scene_root=root,
-        scene_name=scene,
-        sample_rate=sample_rate,
-        W_field=1024,
-        scene_aabb=dataset.scene_box.aabb
+        baseline=baseline, database=database,
+        scene_root=root, scene_name=scene,
+        sample_rate=fs, W_field=1024, scene_aabb=train_ds.scene_box.aabb,
     )
-    model = UnifiedReverbRAGModel(mcfg).to(device).eval()
+    model = UnifiedReverbRAGModel(mcfg).to(device)
 
-    # --- pull one real batch ---
-    batch = next(iter(loader))
+    # --------- Trainer ----------
+    stft_params = fs_to_stft_params(fs)
+    visual_builder = build_visual_feat_builder(baseline)
+    trainer = Trainer(
+        model=model,
+        opt_cfg={},                 # not needed (kept for future)
+        run_cfg=run,
+        device=device,
+        baseline=baseline,
+        visual_feat_builder=visual_builder,
+        stft_params=stft_params,
+    )
 
-    # Common pose inputs
-    mic_xyz = batch["receiver_pos"].to(device).float()   # [B,3]
-    src_xyz = batch["source_pos"].to(device).float()     # [B,3]
-    head_dir = batch["orientation"].to(device).float()   # [B,3]
-    stft = batch["stft"].to(device).float()            # [B,C,F,T]
-    B = mic_xyz.shape[0]
-    C = 1 if database == "raf" else 2
+    # --------- W&B (optional) ----------
+    wandb_run = None
+    wb = cfg.get("wandb", {})
+    try:
+        import wandb
+        if wb.get("project", None):
+            # If user already did `wandb login` in terminal, this just works.
+            wandb_run = wandb.init(project=wb["project"], name=wb.get("run_name", None))
+            wandb_run.config.update(cfg)
+    except Exception as e:
+        print(f"[wandb] disabled ({e})")
 
-    # Time argument to model (raw indices; model will normalize)
-    if dataset_mode == "full":
-        T = int(dataset.max_frames)  # 60
-        t_idx = torch.arange(T, device=device, dtype=torch.float32).view(1, T, 1).expand(B, T, 1)  # [B,T,1] = 0..T-1
-    else:
-        slice_t = batch["slice_t"].to(device).long().view(B, 1, 1)  # [B,1,1]
-        T = 1
-        t_idx = slice_t.float()                                     # raw index, model scales
+    # --------- Train + Eval ----------
+    trainer.train(train_loader, val_loader, dataset_mode=dataset_mode, epochs=epochs, wandb_run=wandb_run)
 
-    # Visual features:
-    # - NeRAF mode: use global 1024-D features (as before).
-    # - AV-NeRF mode: prefer per-pose features if present; fallback to global.pt.
-    if baseline == "avnerf":
-        # try per-pose RGB and/or depth vectors
-        feats = [batch.get(k, None) for k in ("feat_rgb", "feat_depth")]
-        visual_feat = torch.cat(
-            [f.to(device).float() for f in feats],dim=-1)
-    else:
-        vis_1x = load_global_feat(root, scene, device)  # [1,1024]
-        visual_feat = vis_1x.expand(B, -1).contiguous()  # [B,1024]
-
-    # ---- Forward (no grad; smoke test only)
-    with torch.no_grad():
-        out = model(
-            mic_xyz=mic_xyz,
-            src_xyz=src_xyz,
-            head_dir=head_dir,
-            t_idx=t_idx,            # [B,T,1] (0..T-1); model handles normalization
-            visual_feat=visual_feat,
-        )
-
-    # Expect shapes:
-    # full   → [B, C, F, 60]
-    # slice  → [B, C, F, 1]
-    print("==== Dataset Smoke Test ====")
-    print(f"Baseline     : {baseline}")
-    print(f"Database     : {database}")
-    print(f"Scene        : {scene}")
-    print(f"Sample rate  : {sample_rate}")
-    print(f"Mode         : {dataset_mode}")
-    # Print batch semantics depending on the batching mode
-    batching = sampler_cfg.get("batching", "random").lower()
-    bs_cfg = int(sampler_cfg.get("batch_size", 4))
-    if dataset_mode == "slice" and batching == "edc_full":
-        print(f"Batch size   : {bs_cfg} RIRs  → effective rows = {B} slices (should be {bs_cfg}*{dataset.max_frames})")
-    else:
-        print(f"Batch size   : {B} items")
-
-    print(f"Input shapes : mic={tuple(mic_xyz.shape)}, src={tuple(src_xyz.shape)}, "
-          f"head={tuple(head_dir.shape)}, t_idx={tuple(t_idx.shape)}, visual={tuple(visual_feat.shape)}")
-    print(f"Output shape : {tuple(out.shape)}   (expect [B={B}, C={C}, F, T={T}])")
-    print(f"stft shape   : {tuple(stft.shape)}")
-    assert out.ndim == 4 and out.shape[-1] == T and out.shape[1] == C, "Output shape mismatch"
-    print("OK ✅")
+    # --------- Save ----------
+    os.makedirs("checkpoints", exist_ok=True)
+    ckpt_path = os.path.join("checkpoints", f"{baseline}_{database}_{scene}.pt")
+    trainer.save_model(ckpt_path)
+    print(f"Saved: {ckpt_path}")
 
 
 if __name__ == "__main__":

@@ -303,7 +303,6 @@ class Trainer:
                         if wandb_run is not None:
                             wandb_run.log({
                                 "train/edc_term": edc_term.item(),
-                                "train/total_loss": total.item(),
                             })
                     elif self.use_edc_full and not self._warned_slice_edc:
                         print("[warn] edc_full=True but this slice batch is not divisible by T — skipping EDC.")

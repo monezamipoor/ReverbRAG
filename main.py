@@ -1,7 +1,9 @@
 # main.py
+from datetime import datetime
 import os
 import argparse
 import copy
+import shutil
 import yaml
 import random
 import numpy as np
@@ -160,26 +162,50 @@ def main():
         stft_params=stft_params,
     )
 
+    # Derive run_name from config filename (no need for YAML run_name)
+    cfg_path = args.config
+    cfg_file = os.path.splitext(os.path.basename(cfg_path))[0]   # e.g., "base"
+    date_tag = datetime.now().strftime("%Y%m%d-%H%M")
+    run_name = cfg_file
+
+    # Build an output directory: ./runs/<db>/<scene>/<date>_<runname>/
+    save_root = run.get("save_root", "./runs")
+    out_dir = os.path.join(save_root, database, scene, f"{date_tag}_{run_name}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Copy the exact config into the run folder for reproducibility
+    shutil.copy2(cfg_path, os.path.join(out_dir, f"{run_name}.yml"))
+
     # --------- W&B (optional) ----------
     wandb_run = None
     wb = cfg.get("wandb", {})
     try:
         import wandb
         if wb.get("project", None):
-            # If user already did `wandb login` in terminal, this just works.
-            wandb_run = wandb.init(project=wb["project"], name=wb.get("run_name", None))
+            wandb_run = wandb.init(project=wb["project"], name=run_name)
             wandb_run.config.update(cfg)
     except Exception as e:
         print(f"[wandb] disabled ({e})")
 
-    # --------- Train + Eval ----------
-    trainer.train(train_loader, val_loader, dataset_mode=dataset_mode, epochs=epochs, wandb_run=wandb_run)
+    # --------- Resume (optional) ----------
+    resume_cfg = run.get("resume", {}) or {}
+    resume_path = resume_cfg.get("checkpoint", None)
+    load_opt = bool(resume_cfg.get("load_optimizer", False))
+    lr_override = resume_cfg.get("lr_override", None)
 
-    # --------- Save ----------
-    os.makedirs("checkpoints", exist_ok=True)
-    ckpt_path = os.path.join("checkpoints", f"{baseline}_{database}_{scene}.pt")
-    trainer.save_model(ckpt_path)
-    print(f"Saved: {ckpt_path}")
+    # --------- Train + Eval + internal checkpointing ----------
+    trainer.train(
+        train_loader, val_loader,
+        dataset_mode=dataset_mode,
+        epochs=epochs,
+        wandb_run=wandb_run,
+        save_dir=out_dir,
+        save_every=int(run.get("save_every", 10)),
+        cfg_copy_path=os.path.join(out_dir, f"{run_name}.yml"),
+        resume_ckpt=resume_path,
+        resume_load_optimizer=load_opt,
+        resume_lr_override=lr_override,
+    )
 
 
 if __name__ == "__main__":

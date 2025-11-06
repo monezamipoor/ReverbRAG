@@ -1,6 +1,7 @@
 # trainer.py
 import math
 from copy import deepcopy
+import os
 from typing import Dict, Any, Optional
 
 import torch
@@ -40,6 +41,37 @@ class STFTLoss(nn.Module):
                 'audio_mag_loss': self.lm(x_log, y_log)}
 # -------------------------------------------------------------------
 
+# ---- compact EDC loss (computed on full STFT batches only) ----
+def _edc_loss(self, pred_log: torch.Tensor, gt_log: torch.Tensor) -> torch.Tensor:
+    """
+    Liang et al. (2023b) style EDC loss (your screenshot):
+      1) Energy per frame:  M'(d) = sum_f (|M(f,d)|)^2, summed over F (and C if present)
+      2) Schroeder integral: M''(d) = sum_{i=d}^D M'(i)   (reverse cumsum over time)
+      3) L_EDC = || log10(M''_g) - log10(M''_p) ||_1      (mean over batch)
+    Works for logits on log-magnitude STFT with shapes [B,C,F,T] or [B,1,F,T].
+    """
+    # convert back to magnitude (clamped to avoid negatives due to epsilon trick)
+    pred_mag = (pred_log.exp() - 1e-3).clamp_min(0.0)   # [B,C,F,T]
+    gt_mag   = (gt_log.exp()   - 1e-3).clamp_min(0.0)
+
+    # Energy per frame: sum over F (and C)
+    # result shape: [B, T]
+    pred_e = (pred_mag.pow(2)).sum(dim=-2)   # sum over F -> [B,C,T]
+    gt_e   = (gt_mag.pow(2)).sum(dim=-2)
+    if pred_e.dim() == 3:  # still has channel dim
+        pred_e = pred_e.sum(dim=-3)          # sum over C
+        gt_e   = gt_e.sum(dim=-3)
+
+    # Schroeder integral (reverse cumsum over time)
+    pred_tr = torch.flip(torch.cumsum(torch.flip(pred_e, dims=[-1]), dim=-1), dims=[-1])  # [B,T]
+    gt_tr   = torch.flip(torch.cumsum(torch.flip(gt_e,   dims=[-1]), dim=-1),   dims=[-1])
+
+    # Log space (base-10), then L1
+    eps = 1e-12
+    lp = torch.log10(pred_tr + eps)
+    lg = torch.log10(gt_tr   + eps)
+    return F.l1_loss(lp, lg)
+# -------------------------------------------------------------------
 
 def fs_to_stft_params(fs: int):
     if fs == 48000:   # RAF default
@@ -91,6 +123,9 @@ class Trainer:
             self.lambda_edc = float(run_cfg.get("edc_loss", 0.0))  # e.g., 0.2
         else:  # "avnerf": keep it simple & faithful to their MSE-on-mags spirit
             self.loss_fn = None  # using a compact bi/mono-agnostic MSE on log-mags
+        # EDC batching requirement (full-sequence batches only)
+        self.use_edc_full = bool(run_cfg.get("edc_full", False))
+        self._warned_slice_edc = False
 
         # Optimizer (abstract; two presets)
         if self.baseline == "avnerf":
@@ -152,15 +187,31 @@ class Trainer:
         met = self.evaluator.evaluate(pred_log, gt_log)
         return torch.as_tensor(met["edc"], device=pred_log.device, dtype=pred_log.dtype)
 
-    def _loss(self, pred_log: torch.Tensor, gt_log: torch.Tensor, dataset_mode: str):
-        # run loss in fp32 to avoid AMP dtype clashes
-        pred_log = pred_log.float()
-        gt_log   = gt_log.float()
+    def _loss(self, pred_log, gt_log, dataset_mode: str):
+        pred_log = pred_log.float(); gt_log = gt_log.float()
         if self.baseline == "neraf":
-            parts = self.loss_fn(pred_log, gt_log)
-            loss = parts["audio_sc_loss"] + parts["audio_mag_loss"]
-            return loss
-        return F.mse_loss(pred_log, gt_log)
+            parts = self.loss_fn(pred_log, gt_log)  # dict: audio_sc_loss, audio_mag_loss
+            total = parts["audio_sc_loss"] + parts["audio_mag_loss"]
+            edc_val = None
+            if self.lambda_edc > 0.0:
+                if self.use_edc_full and dataset_mode == "full":
+                    edc_term = self._edc_loss(pred_log, gt_log)
+                    total = total + self.lambda_edc * edc_term
+                    edc_val = edc_term.detach()
+                elif self.use_edc_full and dataset_mode != "full" and not self._warned_slice_edc:
+                    print("[warn] edc_full=True but dataset_mode!='full' → skipping EDC loss on slices.")
+                    self._warned_slice_edc = True
+            return total, parts, edc_val
+        # AV-NeRF fallback: single MSE on log-mags
+        mse = F.mse_loss(pred_log, gt_log)
+        return mse, {"mse": mse.detach()}, None
+
+    @staticmethod
+    def _format_parts(parts_dict, edc_val):
+        flat = {k: float(v.item()) if hasattr(v, "item") else float(v) for k, v in parts_dict.items()}
+        if edc_val is not None:
+            flat["edc_loss"] = float(edc_val.item())
+        return flat
 
 
     def _update_lr(self, step_idx: int, steps_per_epoch: int, max_epoch: int, baseline: str):
@@ -182,42 +233,85 @@ class Trainer:
         self.optimizer.param_groups[0]["lr"] = lr
         return lr
 
+    def save_model(self, path: str, extra: Optional[Dict[str, Any]] = None):
+        state = {
+            "model": self.model.state_dict(),
+            "baseline": self.baseline,
+        }
+        # include optimizer state for easier resume
+        state["optimizer"] = self.optimizer.state_dict()
+        if extra:
+            state.update(extra)
+        torch.save(state, path)
+
+    def load_checkpoint(self, path: str, load_optimizer: bool = False, lr_override=None):
+        chk = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(chk["model"], strict=True)
+        if load_optimizer and "optimizer" in chk:
+            self.optimizer.load_state_dict(chk["optimizer"])
+        # optional LR override (keeps things simple)
+        if lr_override is not None:
+            for g in self.optimizer.param_groups:
+                g["lr"] = float(lr_override)
+        print(f"[resume] loaded {path} (load_optimizer={load_optimizer}, lr_override={lr_override})")
+
     # ------------------------- API -------------------------
-    def train(self, train_loader, val_loader, dataset_mode: str, epochs: int, wandb_run=None):
+    def train(
+        self, train_loader, val_loader, dataset_mode: str, epochs: int, wandb_run=None,
+        save_dir: str = None, save_every: int = 10, cfg_copy_path: str = None,
+        resume_ckpt: str = None, resume_load_optimizer: bool = False, resume_lr_override=None,
+    ):
+        # ---- optional resume ----
+        if resume_ckpt:
+            self.load_checkpoint(
+                resume_ckpt,
+                load_optimizer=resume_load_optimizer,
+                lr_override=resume_lr_override
+            )
+
         self.model.train()
         step = 0
         for epoch in range(1, epochs + 1):
             pbar = tqdm(total=len(train_loader), desc=f"[train] epoch {epoch}", leave=False)
             for batch in train_loader:
-                # bring GT STFT log to device depending on mode
                 gt = (batch["stft"] if dataset_mode == "full" else batch["stft_slice"]).to(self.device).float()
-                if dataset_mode != "full":  # [B,1,F] -> [B,1,F,1]
+                if dataset_mode != "full":
                     gt = gt.unsqueeze(-1)
 
                 pred = self._forward_batch(batch, dataset_mode)
                 if pred.dtype != gt.dtype:
                     pred = pred.to(gt.dtype)
-                loss = self._loss(pred, gt, dataset_mode)
-                loss = self._loss(pred, gt, dataset_mode)
+
+                total, parts, edc_val = self._loss(pred, gt, dataset_mode)
 
                 self.optimizer.zero_grad(set_to_none=True)
-                self.scaler.scale(loss).backward()
+                self.scaler.scale(total).backward()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
 
                 lr = self._update_lr(step, len(train_loader), epochs, self.baseline)
 
+                # ---- richer logging & printing ----
+                parts_log = self._format_parts(parts, edc_val)
                 if wandb_run:
-                    wandb_run.log({"train/loss": float(loss.item()), "train/lr": float(lr)})
-                pbar.set_postfix(loss=float(loss.item()))
+                    wandb_log = {"train/loss": float(total.item()), "train/lr": float(lr)}
+                    for k, v in parts_log.items():
+                        wandb_log[f"train/{k}"] = v
+                    wandb_run.log(wandb_log)
+                pbar.set_postfix({"loss": float(total.item())})
                 pbar.update(1)
                 step += 1
             pbar.close()
 
-            # eval every epoch
+            # ---- eval each epoch ----
             eval_metrics = self.eval(val_loader)
             if wandb_run:
                 wandb_run.log({f"eval/{k}": float(v) for k, v in eval_metrics.items()})
+
+            # ---- periodic checkpoint ----
+            if save_dir and (epoch % save_every == 0):
+                ck = os.path.join(save_dir, f"epoch_{epoch}.pt")
+                self.save_model(ck, extra={"epoch": epoch})
 
     @torch.no_grad()
     def eval(self, val_loader):

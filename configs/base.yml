@@ -2,35 +2,41 @@ seed: 42
 
 wandb:
   project: ReverbRAG
-  run_name: neraf_raf_test
-  api_key: null    # optional; set if you want auto-login, otherwise keep null
+  api_key: null    # optional; leave null if you've already `wandb login`
 
 run:
-  model: neraf            # {neraf | avnerf}
-  database: raf           # {raf | soundspaces}
-  scene: FurnishedRoom     # {EmptyRoom | FurnishedRoom for RAF; LivingRoom | OfficeRoom for SoundSpaces}
-  reverbrag: true         # {true | false}
+  model: neraf                # {neraf | avnerf}
+  database: raf               # {raf | soundspaces}
+  scene: FurnishedRoom
+  reverbrag: true
   sample_rate: 48000
   epochs: 100
-  edc_loss: 0.0
+  edc_loss: 0.2
+
+  # NEW – checkpointing & resume
+  save_root: ./checkpoints           # root for run folders
+  save_every: 10              # save every N epochs
+  resume:
+    checkpoint: null          # e.g., ./runs/raf/FurnishedRoom/20251106-2130_base/epoch_50.pt
+    load_optimizer: false     # if true, restore optimizer state (and LR scheduler progress)
+    lr_override: null         # e.g., 1e-4; if set, forces this LR after resume
 
 sampler:
-  dataset_mode: slice      # {full | slice}
-  batching: random       # {random | edc_full}
-  batch_size: 2048            # if edc_full: 4 RIRs -> 4*60 slices per batch
+  dataset_mode: slice
+  batching: edc_full
+  batch_size: 40
   shuffle: true
   num_workers: 8
 
 databases:
   raf:
-    root: ../NeRAF/data/RAF          # base folder for RAF
+    root: ../NeRAF/data/RAF
   soundspaces:
-    root: /data/SoundSpaces                # base folder for SoundSpaces
+    root: /data/SoundSpaces
 
-# Toggle ReverbRAG and set its options
 reverbrag:
-  k: 5                                     # top-K retrieved references
+  k: 5
   index_dir: /data/ReverbRAG/indices
-  ref_aggregation: scaled_dot              # {attn | film}
-  fusion: bahdanau                         # {add | attn | bahdanau}
-  gating: true                             # {true | false}
+  ref_aggregation: scaled_dot
+  fusion: bahdanau
+  gating: true

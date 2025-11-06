@@ -222,7 +222,7 @@ class RAFDataset(Dataset):
             rx, tx, orientation = self._load_positions_and_ori(sid)
             wav_full = self._load_wav(sid)                   # keep loading wav (needed for MSE/auralization)
             stft_full = self._mm_fetch_stft(sid)             # fast memmap path (no cache)
-            edc_curve = self._mm_fetch_edc(sid)              # optional (empty if not built)
+            # edc_curve = self._mm_fetch_edc(sid)              # optional (empty if not built)
             frgb, fdep = self._av_feats(sid)
             return {
                 "id": sid,
@@ -233,7 +233,7 @@ class RAFDataset(Dataset):
                 "stft": stft_full,    # [1, F, 60]
                 "feat_rgb": frgb,
                 "feat_depth": fdep,
-                "edc": edc_curve,
+                # "edc": edc_curve,
             }
 
         # slice mode
@@ -242,7 +242,7 @@ class RAFDataset(Dataset):
         rx, tx, orientation = self._load_positions_and_ori(sid)
         wav_full = self._load_wav(sid)
         stft_full = self._mm_fetch_stft(sid)
-        edc_curve = self._mm_fetch_edc(sid)
+        # edc_curve = self._mm_fetch_edc(sid)
         stft_slice = stft_full[:, :, t]                      # [1, F]
         frgb, fdep = self._av_feats(sid)
         return {
@@ -255,7 +255,7 @@ class RAFDataset(Dataset):
             "stft_slice": stft_slice,    # [1, F]
             "feat_rgb": frgb,
             "feat_depth": fdep,
-            "edc": edc_curve,
+            # "edc": edc_curve,
         }
 
 

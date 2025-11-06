@@ -99,6 +99,31 @@ class RAFDataset(Dataset):
         # --- STFT
         self.stft, self.F_bins, self.hop, self.win = _stft_transform(self.sample_rate, center=self.stft_center)
         self.max_frames = 60  # fixed
+        
+        # --- Sharded memmaps (STFT + EDC)
+        self.mm_index_path = os.path.join(self.feats_dir, "index.json")
+        self._st_shards = []
+        self._edc_shards = []
+        self._sid_ptr = None  # {sid: (shard_id, row)}
+
+        if os.path.exists(self.mm_index_path):
+            with open(self.mm_index_path, "r") as f:
+                idx = json.load(f)
+            # open shard files once (read-only)
+            for sh in idx["shards"]:
+                # STFT shards: (count, F, T) in float16
+                self._st_shards.append(np.memmap(
+                    sh["stft"], dtype=np.float16, mode="r", shape=(sh["count"], self.F_bins, self.max_frames)
+                ))
+                # EDC shards: optional; (count, T) in float32
+                if "edc" in sh and os.path.exists(sh["edc"]):
+                    self._edc_shards.append(np.memmap(
+                        sh["edc"], dtype=np.float32, mode="r", shape=(sh["count"], self.max_frames)
+                    ))
+                else:
+                    self._edc_shards.append(None)
+            # sid → (shard_id, row)
+            self._sid_ptr = {k: tuple(v) for k, v in idx["sid_to_ptr"].items()}
 
         # --- AV feats
         self.has_feats = False
@@ -120,11 +145,7 @@ class RAFDataset(Dataset):
             for sid_idx in range(len(self.ids)):
                 for t in range(self.max_frames):
                     self._lin2pair.append((sid_idx, t))
-
-        # --- CACHING (per-worker)
-        self._cache: OrderedDict[str, Tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
-        self._cache_capacity = int(cache_capacity)
-
+                    
     def __len__(self):
         return len(self.ids) if self.dataset_mode == "full" else len(self.ids) * self.max_frames
 
@@ -150,36 +171,32 @@ class RAFDataset(Dataset):
         wav = wav[:, : int(self.max_len_time * self.sample_rate)]
         return wav  # [1, T]
 
-    def _stft_full(self, wav: torch.Tensor):
-        spec = self.stft(wav)  # [1, F, T_frames]
-        T = spec.shape[-1]
-        if T > self.max_frames:
-            spec = spec[:, :, : self.max_frames]
-        elif T < self.max_frames:
-            minval = spec.abs().min()
-            spec = torch.nn.functional.pad(spec, (0, self.max_frames - T), mode="constant", value=minval)
-        return _logmag(spec)  # [1, F, 60]
-
-    # -------- LRU cache helpers --------
-    def _cache_get_full(self, sid: str) -> Tuple[torch.Tensor, torch.Tensor]:
+    # -------- Fast-path memmap fetchers (no cache) --------
+    def _mm_fetch_stft(self, sid: str) -> torch.Tensor:
         """
-        Return (wav_full[1,T], stft_full[1,F,60]) from per-worker cache, computing if missing.
+        Return [1, F, 60] log-magnitude STFT tensor.
+        Uses sharded memmap if available; else recomputes.
         """
-        if sid in self._cache:
-            wav_full, stft_full = self._cache.pop(sid)  # mark as recently used
-            self._cache[sid] = (wav_full, stft_full)
-            return wav_full, stft_full
+        if self._sid_ptr is not None:
+            k, row = self._sid_ptr[sid]
+            a = self._st_shards[k][row]        # (F, 60) float16
+            x = torch.from_numpy(a.astype(np.float32))  # to fp32
+            return x.unsqueeze(0)              # [1, F, 60]
+        # fallback: recompute once (no caching)
+        wav = self._load_wav(sid)
+        return self._stft_full(wav)
 
-        # miss: compute once
-        wav_full = self._load_wav(sid)
-        stft_full = self._stft_full(wav_full)
+    def _mm_fetch_edc(self, sid: str) -> torch.Tensor:
+        """
+        Return [60] EDC(dB) curve if available, else empty tensor.
+        """
+        if self._sid_ptr is not None and self._edc_shards:
+            k, row = self._sid_ptr[sid]
+            edc_mm = self._edc_shards[k]
+            if edc_mm is not None:
+                return torch.from_numpy(edc_mm[row].astype(np.float32))
+        return torch.empty(0)
 
-        # insert with eviction
-        self._cache[sid] = (wav_full, stft_full)
-        if len(self._cache) > self._cache_capacity:
-            self._cache.popitem(last=False)  # evict LRU
-
-        return wav_full, stft_full
     # -----------------------------------
 
     def _slice_from_wav(self, wav: torch.Tensor, t: int):
@@ -203,7 +220,9 @@ class RAFDataset(Dataset):
         if self.dataset_mode == "full":
             sid = self.ids[index]
             rx, tx, orientation = self._load_positions_and_ori(sid)
-            wav_full, stft_full = self._cache_get_full(sid)  # <-- cached
+            wav_full = self._load_wav(sid)                   # keep loading wav (needed for MSE/auralization)
+            stft_full = self._mm_fetch_stft(sid)             # fast memmap path (no cache)
+            edc_curve = self._mm_fetch_edc(sid)              # optional (empty if not built)
             frgb, fdep = self._av_feats(sid)
             return {
                 "id": sid,
@@ -214,14 +233,16 @@ class RAFDataset(Dataset):
                 "stft": stft_full,    # [1, F, 60]
                 "feat_rgb": frgb,
                 "feat_depth": fdep,
+                "edc": edc_curve,
             }
 
         # slice mode
         sid_idx, t = self._lin2pair[index]
         sid = self.ids[sid_idx]
         rx, tx, orientation = self._load_positions_and_ori(sid)
-        wav_full, stft_full = self._cache_get_full(sid)      # <-- cached
-        wav_slice = self._slice_from_wav(wav_full, t)        # [1, win’]
+        wav_full = self._load_wav(sid)
+        stft_full = self._mm_fetch_stft(sid)
+        edc_curve = self._mm_fetch_edc(sid)
         stft_slice = stft_full[:, :, t]                      # [1, F]
         frgb, fdep = self._av_feats(sid)
         return {
@@ -230,10 +251,11 @@ class RAFDataset(Dataset):
             "source_pos": tx,
             "orientation": orientation,
             "slice_t": t,
-            "wav_slice": wav_slice,      # [1, win’]
+            "wav": wav_full,      # [1, win’]
             "stft_slice": stft_slice,    # [1, F]
             "feat_rgb": frgb,
             "feat_depth": fdep,
+            "edc": edc_curve,
         }
 
 

@@ -159,8 +159,6 @@ class Trainer:
         if self.baseline == "neraf":
             parts = self.loss_fn(pred_log, gt_log)
             loss = parts["audio_sc_loss"] + parts["audio_mag_loss"]
-            if self.lambda_edc > 0.0 and dataset_mode == "full":
-                loss = loss + self.lambda_edc * self._edc_loss(pred_log, gt_log)
             return loss
         return F.mse_loss(pred_log, gt_log)
 

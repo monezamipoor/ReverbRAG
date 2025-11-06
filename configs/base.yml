@@ -11,16 +11,15 @@ run:
   scene: FurnishedRoom     # {EmptyRoom | FurnishedRoom for RAF; LivingRoom | OfficeRoom for SoundSpaces}
   reverbrag: true         # {true | false}
   sample_rate: 48000
-  epochs: 20
-  edc_loss: 0.2
+  epochs: 100
+  edc_loss: 0.0
 
 sampler:
   dataset_mode: slice      # {full | slice}
   batching: random       # {random | edc_full}
   batch_size: 2048            # if edc_full: 4 RIRs -> 4*60 slices per batch
   shuffle: true
-  num_workers: 4
-  cache_capacity: 8        # per-worker SIDs kept hot (LRU)
+  num_workers: 8
 
 databases:
   raf:

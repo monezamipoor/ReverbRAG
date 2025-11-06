@@ -78,12 +78,44 @@ class UnifiedEvaluator:
     @torch.no_grad()
     def _stft_loss_neraf(self, pred_log: torch.Tensor, gt_log: torch.Tensor) -> float:
         """
-        NeRAF-style STFT: MSE on linear magnitude * 2 over (B,C,F,T).
+        NeRAF-style 'STFT error' on RAF:
+        1) Reconstruct waveforms via Griffin–Lim from magnitudes.
+        2) Recompute STFTs with the same n_fft/win/hop.
+        3) Take mean absolute difference in log-magnitude domain.
+            STFT error = mean(| log(M) - log(M_gt) |).
         """
-        pred_mag = self._logmag_to_mag(pred_log)
-        gt_mag   = self._logmag_to_mag(gt_log)
-        loss = torch.mean((pred_mag - gt_mag) ** 2) * 2.0
-        return float(loss.item())
+        # 1) Reconstruct waveforms from provided log-magnitude STFTs
+        wav_pred = self._waveforms_from_logmag(pred_log)  # (B, C, Tw)
+        wav_gt   = self._waveforms_from_logmag(gt_log)    # (B, C, Tw)
+
+        B, C, nfreq, _ = pred_log.shape
+        n_fft, win_length, hop_length = self._fft_params_from_nfreq(nfreq)
+
+        # 2) Recompute STFTs (magnitude) from waveforms
+        def stft_mag(x: torch.Tensor) -> torch.Tensor:
+            # x: (B, C, Tw) -> return (B, C, F, T)
+            mags = []
+            for b in range(x.shape[0]):
+                ch = []
+                for c in range(x.shape[1]):
+                    Xi = torch.stft(
+                        torch.from_numpy(x[b, c]).to(pred_log.device),
+                        n_fft=n_fft, hop_length=hop_length, win_length=win_length,
+                        window=torch.hann_window(win_length, device=pred_log.device),
+                        return_complex=True
+                    ).abs()  # (F, T)
+                    ch.append(Xi.unsqueeze(0))
+                mags.append(torch.stack(ch, dim=0))
+            return torch.stack(mags, dim=0)  # (B, C, F, T)
+
+        M_pred = stft_mag(wav_pred)
+        M_gt   = stft_mag(wav_gt)
+
+        # 3) Mean absolute error in log domain
+        eps = 1e-3  # same stabiliser as NeRAF
+        err = (torch.log(M_pred + eps) - torch.log(M_gt + eps)).abs().mean()
+        return float(err.item())
+
 
     @torch.no_grad()
     def _waveforms_from_logmag(self, logmag: torch.Tensor) -> np.ndarray:

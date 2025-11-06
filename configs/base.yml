@@ -22,9 +22,9 @@ run:
     lr_override: null         # e.g., 1e-4; if set, forces this LR after resume
 
 sampler:
-  dataset_mode: slice
-  batching: edc_full
-  batch_size: 40
+  dataset_mode: slice      # {full | slice}
+  batching: edc_full       # {random | edc_full}
+  batch_size: 40            # if edc_full: 4 RIRs -> 4*60 slices per batch
   shuffle: true
   num_workers: 8
 
@@ -35,8 +35,8 @@ databases:
     root: /data/SoundSpaces
 
 reverbrag:
-  k: 5
+  k: 5                                     # top-K retrieved references
   index_dir: /data/ReverbRAG/indices
-  ref_aggregation: scaled_dot
-  fusion: bahdanau
-  gating: true
+  ref_aggregation: scaled_dot              # {attn | film}
+  fusion: bahdanau                         # {add | attn | bahdanau}
+  gating: true                             # {true | false}

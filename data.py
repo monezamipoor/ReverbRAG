@@ -3,7 +3,7 @@ import os, json, pickle
 from collections import OrderedDict
 from typing import Dict, Any, List, Tuple
 import numpy as np
-from utils import _take_topk_refs
+from utils import _take_topk_refs, build_ref_bank_and_mapping
 import torch
 from torch.utils.data import Dataset
 import torchaudio
@@ -131,47 +131,18 @@ class RAFDataset(Dataset):
         self.rag_topk = int((reverbrag_cfg or {}).get("k", 0))
         
         # ---- ReverbRAG reference bank ----
-        self.ref_bank_ids: List[str] = []
-        self.ref_bank_stft: torch.Tensor = torch.empty(0)   # [R, 1, F, 60] log-mags
-        self._sid_to_refidx: Dict[str, List[int]] = {}
+        self.ref_bank_ids, self._sid_to_refidx = build_ref_bank_and_mapping(
+            meta_dir=self.meta_dir,
+            split_name=split,
+            rag_topk=self.rag_topk,
+            use_refs_json=True  # or False if you want to ignore references.json entirely
+        )
 
-        if self.reverbrag_enabled and self.rag_topk > 0:
-            ref_json_path = os.path.join(self.meta_dir, "references.json")
-            if os.path.exists(ref_json_path):
-                with open(ref_json_path, "r") as f:
-                    ref_map_raw = json.load(f)              # may be flat or split dict
-                # If file is {"train": {...}, "validation": {...}}, pick the current split if present
-                ref_map = ref_map_raw.get(split, ref_map_raw) if isinstance(ref_map_raw, dict) else ref_map_raw
-
-                # Collect unique reference IDs from the fixed reference set
-                ref_set = set()
-                for sid, lst in ref_map.items():
-                    sidn = f"{int(sid):06d}" if str(sid).isdigit() else str(sid)
-                    topk = _take_topk_refs(lst, self.rag_topk)
-                    ref_set.update(topk)
-                self.ref_bank_ids = sorted(list(ref_set))
-
-                # Build id -> bank index
-                ref_id2idx = {rid: i for i, rid in enumerate(self.ref_bank_ids)}
-
-                # Preload STFT bank ONCE (static across epochs)
-                # Stored as [R, 1, F, 60] log-magnitude (same convention as stft_full)
-                bank = []
-                for rid in self.ref_bank_ids:
-                    st = self._mm_fetch_stft(rid)           # [1, F, 60]
-                    bank.append(st)
-                if len(bank):
-                    self.ref_bank_stft = torch.stack(bank, dim=0)  # [R, 1, F, 60]
-
-                # Map each sample id to its list of ref indices
-                for sid, lst in ref_map.items():
-                    sidn = f"{int(sid):06d}" if str(sid).isdigit() else str(sid)
-                    ids = _take_topk_refs(lst, self.rag_topk)
-                    arr = [(rid, ref_id2idx.get(rid, -1)) for rid in ids]
-                    idxs = [j for (_, j) in arr if j >= 0]
-                    while len(idxs) < self.rag_topk:
-                        idxs.append(-1)
-                    self._sid_to_refidx[sidn] = idxs
+        self.ref_bank_stft = torch.empty(0)
+        if self.reverbrag_enabled and self.rag_topk > 0 and len(self.ref_bank_ids) > 0:
+            bank = [self._mm_fetch_stft(rid) for rid in self.ref_bank_ids]  # [R] of [1,F,60]
+            if len(bank):
+                self.ref_bank_stft = torch.stack(bank, dim=0)
 
         # expose for samplers
         self.ref_bank_size = len(self.ref_bank_ids)

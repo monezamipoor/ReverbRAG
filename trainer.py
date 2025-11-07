@@ -100,6 +100,7 @@ class Trainer:
         baseline: str,
         visual_feat_builder,   # callable(batch, B)-> Tensor [B, Dv]
         stft_params: Optional[Dict[str, int]] = None,
+        ref_bank: torch.Tensor = None, ref_bank_ids=None
     ):
         self.model = model.to(device)
         self.device = device
@@ -121,10 +122,10 @@ class Trainer:
         # Loss (different per baseline)
         if self.baseline == "neraf":
             self.loss_fn = STFTLoss(loss_type='mse')
-            self.lambda_edc = float(run_cfg.get("edc_loss", 0.0))  # e.g., 0.2
         else:  # "avnerf": keep it simple & faithful to their MSE-on-mags spirit
             self.loss_fn = None  # using a compact bi/mono-agnostic MSE on log-mags
         # EDC batching requirement (full-sequence batches only)
+        self.lambda_edc = float(run_cfg.get("edc_loss", 0.0))  # e.g., 0.2
         self.use_edc_full = bool(run_cfg.get("edc_full", False))
         self._warned_slice_edc = False
 
@@ -145,6 +146,11 @@ class Trainer:
             self._neraf_total_steps = None  # set on first train()
 
         self.visual_feat_builder = visual_feat_builder
+        if ref_bank is None or ref_bank.numel() == 0:
+            self.ref_bank = None         # disables RAG path
+        else:
+            self.ref_bank = ref_bank     # [R, 1, F, 60] (log-mag)
+        self.ref_bank_ids = ref_bank_ids or []
 
     # ------------- util: build time indices for both modes -------------
     @staticmethod
@@ -157,22 +163,48 @@ class Trainer:
         # slice mode
         slice_t = batch["slice_t"].to(device).long()
         return slice_t.float().view(slice_t.shape[0], 1, 1)  # [B,1,1]
+    
     # -------------------------------------------------------------------
+
+    def _gather_refs(self, batch_indices: torch.Tensor):
+        """
+        batch_indices: [B, K] with bank indices (or -1).
+        returns: refs_logmag [B, K, 1, F, 60], mask [B, K] (True=valid)
+        """
+        if self.ref_bank is None or batch_indices is None:
+            return None, None
+        idx = batch_indices.clone()
+        mask = idx >= 0
+        # safe indexing: replace -1 with 0 to avoid crash, then mask later
+        idx[~mask] = 0
+        # pull from CPU bank then move to device
+        refs = self.ref_bank.index_select(0, idx.view(-1)).view(
+            idx.shape[0], idx.shape[1], *self.ref_bank.shape[1:]
+        )  # [B,K,1,F,60]
+        return refs.to(self.device, non_blocking=True), mask.to(self.device)
 
     def _forward_batch(self, batch: Dict[str, torch.Tensor], dataset_mode: str):
         full = (dataset_mode == "full")
-        # Common pose tensors
         mic = batch["receiver_pos"].to(self.device).float()
         src = batch["source_pos"].to(self.device).float()
         head = batch["orientation"].to(self.device).float()
         t_idx = self._make_t_idx(batch, self.device, full)
-        # Visual features (unified)
         B = mic.shape[0]
         vfeat = self.visual_feat_builder(batch, B).to(self.device).float()
-        # Forward
+
+        # ---- ReverbRAG refs for this batch (optional) ----
+        ref_idx = batch.get("ref_indices", None)
+        refs_logmag = refs_mask = None
+        if ref_idx is not None:
+            refs_logmag, refs_mask = self._gather_refs(ref_idx)
+
         with autocast(True):
-            pred = self.model(mic_xyz=mic, src_xyz=src, head_dir=head, t_idx=t_idx, visual_feat=vfeat)
-        return pred  # [B,C,F,T or 1]
+            pred = self.model(
+                mic_xyz=mic, src_xyz=src, head_dir=head, t_idx=t_idx,
+                visual_feat=vfeat,
+                refs_logmag=refs_logmag, refs_mask=refs_mask,    # <— NEW
+            )
+        return pred
 
     # ---- compact EDC loss (computed on full STFT batches only) ----
     def _edc_loss(self, pred_log: torch.Tensor, gt_log: torch.Tensor):

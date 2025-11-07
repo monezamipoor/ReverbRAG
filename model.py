@@ -10,6 +10,7 @@
 from dataclasses import dataclass
 from typing import Literal, Optional
 
+from generator import ReverbRAGGenerator
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -332,30 +333,33 @@ class UnifiedReverbRAGModel(nn.Module):
         # Decoder (same heads in both modes; AV-NeRF may use FiLM on W)
         self.decoder = NeRAFDecoder(W=cfg.W_field, n_freq=self.N_freq,
                                     n_channels=self.n_channels, dir_cond_dim=dir_cond_dim)
+        
+        # ---- ReverbRAG (lightweight placeholder for now) ----
+        self.use_rag = True    # trainer/builder can rely on dataset+bank existence
+        self.rag_gen = ReverbRAGGenerator(
+            n_freq=self.N_freq, W=cfg.W_field, mode="passthrough"
+        )
 
     def forward(
         self,
-        mic_xyz: torch.Tensor,       # [B,3]
-        src_xyz: torch.Tensor,       # [B,3]
-        head_dir: torch.Tensor,      # [B,3]
-        t_idx: torch.Tensor,         # [B,T,1]
-        visual_feat: torch.Tensor,   # [B,Dv]
+        mic_xyz: torch.Tensor,
+        src_xyz: torch.Tensor,
+        head_dir: torch.Tensor,
+        t_idx: torch.Tensor,
+        visual_feat: torch.Tensor,
+        refs_logmag: torch.Tensor = None,     # [B,K,1,F,60] log-mag
+        refs_mask: torch.Tensor = None,       # [B,K] (bool)
     ) -> torch.Tensor:
-        """
-        Returns:
-            stft_pred: [B, C, F, T]
-        """
         if self.encoder_kind == "neraf":
-            # Orientation is encoded in the encoder (faithful NeRAF)
             w = self.encoder(mic_xyz, src_xyz, head_dir, t_idx, visual_feat, self.aabb)  # [B,T,W]
-            stft = self.decoder(w)  # no dir_cond
-            return stft
+            # (for now) just let generator optionally pre-process w / refs and return a (maybe) modified w
+            w = self.rag_gen.pre_fuse(w, refs_logmag, refs_mask) if self.use_rag else w
+            return self.decoder(w)
 
-        # AV-NeRF: do NOT feed head_dir into the encoder
-        w = self.encoder(mic_xyz, src_xyz, t_idx, visual_feat, self.aabb)  # [B,T,W]
-        # Orientation SH(3D) conditions the decoder (FiLM)
+        # AV-NeRF path
+        w = self.encoder(mic_xyz, src_xyz, t_idx, visual_feat, self.aabb)
         B, T = t_idx.shape[0], t_idx.shape[1]
-        rot_e = self.rot_encoding(head_dir)                     # [B, Drot]
-        rot_e = rot_e.unsqueeze(1).expand(B, T, -1).contiguous()  # [B,T,Drot]
-        stft = self.decoder(w, dir_cond=rot_e)
-        return stft
+        rot_e = self.rot_encoding(head_dir).unsqueeze(1).expand(B, T, -1).contiguous()
+        # same pre-fuse hook
+        w = self.rag_gen.pre_fuse(w, refs_logmag, refs_mask) if self.use_rag else w
+        return self.decoder(w, dir_cond=rot_e)

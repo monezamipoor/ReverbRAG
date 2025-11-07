@@ -3,6 +3,7 @@ import os, json, pickle
 from collections import OrderedDict
 from typing import Dict, Any, List, Tuple
 import numpy as np
+from utils import _take_topk_refs
 import torch
 from torch.utils.data import Dataset
 import torchaudio
@@ -56,7 +57,7 @@ class RAFDataset(Dataset):
     def __init__(self, scene_root: str, split: str, model_kind: str,
                  sample_rate: int = 48000, max_len_time: float = 0.32,
                  center_stft: bool = True, dataset_mode: str = "full",
-                 cache_capacity: int = 8):
+                 reverbrag_cfg: dict = None):
         super().__init__()
         assert dataset_mode in ("full", "slice")
         self.scene_root = scene_root
@@ -124,7 +125,57 @@ class RAFDataset(Dataset):
                     self._edc_shards.append(None)
             # sid → (shard_id, row)
             self._sid_ptr = {k: tuple(v) for k, v in idx["sid_to_ptr"].items()}
+            
+        # --- ReverbRAG references
+        self.reverbrag_enabled = bool((reverbrag_cfg or {}).get("enabled", False))
+        self.rag_topk = int((reverbrag_cfg or {}).get("k", 0))
+        
+        # ---- ReverbRAG reference bank ----
+        self.ref_bank_ids: List[str] = []
+        self.ref_bank_stft: torch.Tensor = torch.empty(0)   # [R, 1, F, 60] log-mags
+        self._sid_to_refidx: Dict[str, List[int]] = {}
 
+        if self.reverbrag_enabled and self.rag_topk > 0:
+            ref_json_path = os.path.join(self.meta_dir, "references.json")
+            if os.path.exists(ref_json_path):
+                with open(ref_json_path, "r") as f:
+                    ref_map_raw = json.load(f)              # may be flat or split dict
+                # If file is {"train": {...}, "validation": {...}}, pick the current split if present
+                ref_map = ref_map_raw.get(split, ref_map_raw) if isinstance(ref_map_raw, dict) else ref_map_raw
+
+                # Collect unique reference IDs from the fixed reference set
+                ref_set = set()
+                for sid, lst in ref_map.items():
+                    sidn = f"{int(sid):06d}" if str(sid).isdigit() else str(sid)
+                    topk = _take_topk_refs(lst, self.rag_topk)
+                    ref_set.update(topk)
+                self.ref_bank_ids = sorted(list(ref_set))
+
+                # Build id -> bank index
+                ref_id2idx = {rid: i for i, rid in enumerate(self.ref_bank_ids)}
+
+                # Preload STFT bank ONCE (static across epochs)
+                # Stored as [R, 1, F, 60] log-magnitude (same convention as stft_full)
+                bank = []
+                for rid in self.ref_bank_ids:
+                    st = self._mm_fetch_stft(rid)           # [1, F, 60]
+                    bank.append(st)
+                if len(bank):
+                    self.ref_bank_stft = torch.stack(bank, dim=0)  # [R, 1, F, 60]
+
+                # Map each sample id to its list of ref indices
+                for sid, lst in ref_map.items():
+                    sidn = f"{int(sid):06d}" if str(sid).isdigit() else str(sid)
+                    ids = _take_topk_refs(lst, self.rag_topk)
+                    arr = [(rid, ref_id2idx.get(rid, -1)) for rid in ids]
+                    idxs = [j for (_, j) in arr if j >= 0]
+                    while len(idxs) < self.rag_topk:
+                        idxs.append(-1)
+                    self._sid_to_refidx[sidn] = idxs
+
+        # expose for samplers
+        self.ref_bank_size = len(self.ref_bank_ids)
+            
         # --- AV feats
         self.has_feats = False
         if self.model_kind == "avnerf":
@@ -177,8 +228,9 @@ class RAFDataset(Dataset):
         Return [1, F, 60] log-magnitude STFT tensor.
         Uses sharded memmap if available; else recomputes.
         """
-        if self._sid_ptr is not None:
-            k, row = self._sid_ptr[sid]
+        ptr = getattr(self, "_sid_ptr", None)
+        if ptr is not None:
+            k, row = ptr[sid]
             a = self._st_shards[k][row]        # (F, 60) float16
             x = torch.from_numpy(a.astype(np.float32))  # to fp32
             return x.unsqueeze(0)              # [1, F, 60]
@@ -220,43 +272,44 @@ class RAFDataset(Dataset):
         if self.dataset_mode == "full":
             sid = self.ids[index]
             rx, tx, orientation = self._load_positions_and_ori(sid)
-            wav_full = self._load_wav(sid)                   # keep loading wav (needed for MSE/auralization)
-            stft_full = self._mm_fetch_stft(sid)             # fast memmap path (no cache)
-            # edc_curve = self._mm_fetch_edc(sid)              # optional (empty if not built)
+            wav_full = self._load_wav(sid)
+            stft_full = self._mm_fetch_stft(sid)
             frgb, fdep = self._av_feats(sid)
-            return {
+            out = {
                 "id": sid,
-                "receiver_pos": rx,
-                "source_pos": tx,
+                "receiver_pos": rx, 
+                "source_pos": tx, 
                 "orientation": orientation,
-                "wav": wav_full,      # [1, T]
-                "stft": stft_full,    # [1, F, 60]
-                "feat_rgb": frgb,
+                "wav": wav_full, 
+                "stft": stft_full,
+                "feat_rgb": frgb, 
                 "feat_depth": fdep,
-                # "edc": edc_curve,
+            }
+        else:
+            sid_idx, t = self._lin2pair[index]
+            sid = self.ids[sid_idx]
+            rx, tx, orientation = self._load_positions_and_ori(sid)
+            wav_full = self._load_wav(sid)
+            stft_full = self._mm_fetch_stft(sid)
+            frgb, fdep = self._av_feats(sid)
+            out = {
+                "id": sid,
+                "receiver_pos": rx, 
+                "source_pos": tx, 
+                "orientation": orientation,
+                "slice_t": t,
+                "wav": wav_full,
+                "stft_slice": stft_full[:, :, t],
+                "feat_rgb": frgb, 
+                "feat_depth": fdep,
             }
 
-        # slice mode
-        sid_idx, t = self._lin2pair[index]
-        sid = self.ids[sid_idx]
-        rx, tx, orientation = self._load_positions_and_ori(sid)
-        wav_full = self._load_wav(sid)
-        stft_full = self._mm_fetch_stft(sid)
-        # edc_curve = self._mm_fetch_edc(sid)
-        stft_slice = stft_full[:, :, t]                      # [1, F]
-        frgb, fdep = self._av_feats(sid)
-        return {
-            "id": sid,
-            "receiver_pos": rx,
-            "source_pos": tx,
-            "orientation": orientation,
-            "slice_t": t,
-            "wav": wav_full,      # [1, win’]
-            "stft_slice": stft_slice,    # [1, F]
-            "feat_rgb": frgb,
-            "feat_depth": fdep,
-            # "edc": edc_curve,
-        }
+        # attach top-K reference indices if available
+        if self.reverbrag_enabled and self.rag_topk > 0:
+            idxs = self._sid_to_refidx.get(sid, [])
+            if idxs:
+                out["ref_indices"] = torch.tensor(idxs, dtype=torch.long)   # [K] in bank
+        return out
 
 
 class SoundSpacesDataset(Dataset):
@@ -270,6 +323,10 @@ def build_dataset(opt: Dict[str, Any], split: str):
     scene = _load_yaml_like_dict(opt, "run", "scene", default=None)
     dataset_mode = _load_yaml_like_dict(opt, "sampler", "dataset_mode", default="full")
     cache_capacity = _load_yaml_like_dict(opt, "sampler", "cache_capacity", default=8)
+    rag_cfg = {
+        "enabled": bool(_load_yaml_like_dict(opt, "run", "reverbrag", default=False)),
+        "k": int(_load_yaml_like_dict(opt, "reverbrag", "k", default=0)),
+    }
 
     if db == "raf":
         base = _load_yaml_like_dict(opt, "databases", "raf", "root", default=None)
@@ -279,7 +336,7 @@ def build_dataset(opt: Dict[str, Any], split: str):
         sr = _load_yaml_like_dict(opt, "run", "sample_rate", default=48000)
         return RAFDataset(scene_root=scene_root, split=split, model_kind=model_kind,
                           sample_rate=sr, dataset_mode=dataset_mode,
-                          cache_capacity=cache_capacity)
+                        reverbrag_cfg=rag_cfg)
 
     elif db == "soundspaces":
         base = _load_yaml_like_dict(opt, "databases", "soundspaces", "root", default=None)

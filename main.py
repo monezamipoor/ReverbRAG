@@ -133,6 +133,8 @@ def main():
     # --------- Build datasets/loaders ----------
     train_ds = build_dataset(cfg, split="train")
     train_loader, dataset_mode = _build_loader(cfg, train_ds, force_full=False)
+    ref_bank = getattr(train_ds, "ref_bank_stft", torch.empty(0))
+    ref_bank_ids = getattr(train_ds, "ref_bank_ids", [])
 
     # Val: force dataset_mode='full' as requested
     val_cfg = copy.deepcopy(cfg)
@@ -160,6 +162,8 @@ def main():
         baseline=baseline,
         visual_feat_builder=visual_builder,
         stft_params=stft_params,
+        ref_bank=ref_bank,          
+        ref_bank_ids=ref_bank_ids,
     )
 
     # Derive run_name from config filename (no need for YAML run_name)

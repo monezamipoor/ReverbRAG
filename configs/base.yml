@@ -7,11 +7,11 @@ wandb:
 run:
   model: neraf                # {neraf | avnerf}
   database: raf               # {raf | soundspaces}
-  scene: FurnishedRoom
+  scene: EmptyRoom        # e.g., EmptyRoom, FurnishedRoom
   reverbrag: true
   sample_rate: 48000
   epochs: 100
-  edc_loss: 0.2
+  edc_loss: 0.0
 
   # NEW – checkpointing & resume
   save_root: ./checkpoints           # root for run folders
@@ -23,8 +23,8 @@ run:
 
 sampler:
   dataset_mode: slice      # {full | slice}
-  batching: edc_full       # {random | edc_full}
-  batch_size: 40            # if edc_full: 4 RIRs -> 4*60 slices per batch
+  batching: random       # {random | edc_full}
+  batch_size: 2048            # if edc_full: 4 RIRs -> 4*60 slices per batch
   shuffle: true
   num_workers: 8
 

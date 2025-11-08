@@ -7,24 +7,24 @@ wandb:
 run:
   model: neraf                # {neraf | avnerf}
   database: raf               # {raf | soundspaces}
-  scene: EmptyRoom        # e.g., EmptyRoom, FurnishedRoom
-  reverbrag: true
+  scene: FurnishedRoom        # e.g., EmptyRoom, FurnishedRoom
+  reverbrag: false           # {true | false}
   sample_rate: 48000
   epochs: 100
   edc_loss: 0.0
 
   # NEW – checkpointing & resume
-  save_root: ./checkpoints           # root for run folders
+  save_root: ./checkpoints          # root for run folders
   save_every: 10              # save every N epochs
   resume:
-    checkpoint: null          # e.g., ./runs/raf/FurnishedRoom/20251106-2130_base/epoch_50.pt
+    checkpoint: null        # e.g., ./runs/raf/FurnishedRoom/20251106-2130_base/epoch_50.pt
     load_optimizer: false     # if true, restore optimizer state (and LR scheduler progress)
     lr_override: null         # e.g., 1e-4; if set, forces this LR after resume
 
 sampler:
   dataset_mode: slice      # {full | slice}
   batching: random       # {random | edc_full}
-  batch_size: 2048            # if edc_full: 4 RIRs -> 4*60 slices per batch
+  batch_size: 4096            # if edc_full: 4 RIRs -> 4*60 slices per batch ()
   shuffle: true
   num_workers: 8
 

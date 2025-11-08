@@ -140,6 +140,7 @@ def main():
     val_cfg = copy.deepcopy(cfg)
     val_cfg.setdefault("sampler", {})
     val_cfg["sampler"]["dataset_mode"] = "full"
+    val_cfg["sampler"]["batch_size"] = 2048
     val_ds = build_dataset(val_cfg, split="validation")
     val_loader, _ = _build_loader(val_cfg, val_ds, force_full=True)
 

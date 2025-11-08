@@ -117,7 +117,7 @@ class Trainer:
             hop_length=stftp["hop_len"],
             power=1,
         ).to(device)
-        self.evaluator = UnifiedEvaluator(fs=fs, edc_bins=60, edc_dist="l2")
+        self.evaluator = UnifiedEvaluator(fs=fs, edc_bins=60, edc_dist="l1")
 
         # Loss (different per baseline)
         if self.baseline == "neraf":
@@ -224,7 +224,7 @@ class Trainer:
         pred_log = pred_log.float(); gt_log = gt_log.float()
         if self.baseline == "neraf":
             parts = self.loss_fn(pred_log, gt_log)  # dict: audio_sc_loss, audio_mag_loss
-            total = parts["audio_sc_loss"] + parts["audio_mag_loss"]
+            total = 0.1 * parts["audio_sc_loss"] + 1.0 * parts["audio_mag_loss"]
             edc_val = None
             if self.lambda_edc > 0.0:
                 if self.use_edc_full and dataset_mode == "full":

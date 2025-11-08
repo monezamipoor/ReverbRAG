@@ -4,6 +4,9 @@ outputs/
 renders/
 features/
 checkpoints/
+dist_cache/
+logs/
+wandb/
 *.pkl
 *.pt
 *.pth
@@ -35,3 +38,5 @@ env/
 .vscode/
 .venv/.git-credentials
 .git-credentials
+references_furnished.json
+references_empty.json

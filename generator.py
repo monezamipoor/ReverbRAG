@@ -11,7 +11,7 @@ ACTS = {
     "silu": nn.SiLU,
 }
 
-class RAGGenerator(nn.Module):
+class ReverbRAGGenerator(nn.Module):
     """
     Minimum viable RAG generator that actually 'listens'.
 

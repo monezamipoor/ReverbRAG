@@ -7,7 +7,7 @@ wandb:
 run:
   model: avnerf                # {neraf | avnerf}
   database: raf               # {raf | soundspaces}
-  scene: FurnishedRoom        # e.g., EmptyRoom, FurnishedRoom
+  scene: EmptyRoom        # e.g., EmptyRoom, FurnishedRoom
   reverbrag: true           # {true | false}
   sample_rate: 48000
   epochs: 100

@@ -328,6 +328,20 @@ class Trainer:
         self.optimizer.param_groups[0]["lr"] = lr
         return lr
 
+    def _pack_slices_to_full(x: torch.Tensor, T: int) -> torch.Tensor:
+        """
+        x: [B*T, C, F, 1]  ->  [B, C, F, T]
+        Requires that the dataloader groups slices per SID contiguously in time
+        (EDCFullBatchSampler does this).
+        """
+        B = x.shape[0] // T
+        return (
+            x.view(B, T, x.shape[1], x.shape[2], x.shape[3])  # [B,T,C,F,1]
+            .permute(0, 2, 3, 1, 4)                          # [B,C,F,T,1]
+            .squeeze(-1)                                     # [B,C,F,T]
+            .contiguous()
+        )
+
     def save_model(self, path: str, extra: Optional[Dict[str, Any]] = None):
         state = {
             "model": self.model.state_dict(),
@@ -381,16 +395,14 @@ class Trainer:
                 total, parts, edc_val = self._loss(pred, gt, dataset_mode)
 
                 # inside train() loop, after total, parts, edc_val = self._loss(...)
+                if self.lambda_edc > 0.0 and getattr(train_loader.sampler, "__class__", None).__name__ != "EDCFullBatchSampler":
+                    print("[warn] EDC loss expects EDCFullBatchSampler (contiguous T slices per SID).")
                 if self.lambda_edc > 0.0:
-                    # If we’re in slice mode, pack slices into full sequences (T=60).
-                    T = getattr(train_loader.dataset, "max_frames", None)  # e.g., 60
+                    T = getattr(train_loader.dataset, "max_frames", None)  # expect 60
                     if T is not None and (gt.shape[0] % T == 0):
-                        B = gt.shape[0] // T
-                        # pred: [B*T, C, F, 1] -> [B, C, F, T]
-                        pred_full = pred.view(B, T, *pred.shape[1:]).transpose(1, -1).squeeze(-1)
-                        gt_full   = gt.view(B, T, *gt.shape[1:]).transpose(1, -1).squeeze(-1)
-                        # differentiable EDC on STFT
-                        edc_term = self._edc_loss(pred_full, gt_full, valid_mask=None, p=1)
+                        pred_full = self._pack_slices_to_full(pred, T)
+                        gt_full   = self._pack_slices_to_full(gt,   T)
+                        edc_term  = self._edc_loss(pred_full, gt_full, valid_mask=None, p=1)
                         total = total + self.lambda_edc * edc_term
                         edc_val = edc_term.detach()
                     else:
@@ -411,6 +423,8 @@ class Trainer:
                     wandb_log = {"train/loss": float(total.item()), "train/lr": float(lr)}
                     for k, v in parts_log.items():
                         wandb_log[f"train/{k}"] = v
+                    if edc_val is not None:
+                        wandb_log["train/edc_loss"] = float(edc_val)
                     wandb_run.log(wandb_log)
                 pbar.set_postfix({"loss": float(total.item())})
                 pbar.update(1)

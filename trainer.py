@@ -77,7 +77,7 @@ class Trainer:
         self.baseline = baseline.lower()
         self.run_cfg = run_cfg
         self.scaler = GradScaler(enabled=True)
-
+        self.log_every = int(run_cfg.get("log_every", 50))
         # STFT/ISTFT & Evaluator (parameters taken “from main.py”)
         fs = int(run_cfg.get("sample_rate", 48000))
         stftp = stft_params or fs_to_stft_params(fs)
@@ -331,6 +331,23 @@ class Trainer:
         if extra:
             state.update(extra)
         torch.save(state, path)
+        
+    def _grad_norm_of(self, submodule_name: str) -> float:
+        mod = getattr(self.model, submodule_name, None)
+        if mod is None:
+            return 0.0
+        sq = 0.0
+        for p in mod.parameters():
+            if p.grad is not None:
+                sq += float(p.grad.detach().pow(2).sum().item())
+        return (sq ** 0.5)
+
+    def _grad_norm_total(self) -> float:
+        sq = 0.0
+        for p in self.model.parameters():
+            if p.grad is not None:
+                sq += float(p.grad.detach().pow(2).sum().item())
+        return (sq ** 0.5)
 
     def load_checkpoint(self, path: str, load_optimizer: bool = False, lr_override=None):
         chk = torch.load(path, map_location=self.device)
@@ -365,6 +382,8 @@ class Trainer:
         self.model.train()
         step = 0
         for epoch in range(1, epochs + 1):
+            if hasattr(self.model, "set_logger"):
+                self.model.set_logger(wandb_run)  # NEW: let model/generator know about wandb
             pbar = tqdm(total=len(train_loader), desc=f"[train] epoch {epoch}", leave=False)
             for batch in train_loader:
                 # infer mode: slice batches carry 'stft_slice'
@@ -410,19 +429,38 @@ class Trainer:
 
                 self.optimizer.zero_grad(set_to_none=True)
                 self.scaler.scale(total).backward()
+                
+                
+                # ---- NEW: gradient norms before step (every self.log_every) ----
+                if (wandb_run is not None) and (step % self.log_every == 0):
+                    enc_gn = self._grad_norm_of("encoder")
+                    dec_gn = self._grad_norm_of("decoder")
+                    gen_gn = self._grad_norm_of("rag_gen")
+                    tot_gn = self._grad_norm_total()
+                    gn_log = {
+                        "grads/encoder_gn": enc_gn, "grads/decoder_gn": dec_gn,
+                        "grads/generator_gn": gen_gn, "grads/total_gn": tot_gn,
+                    }
+                    wandb_run.log(gn_log)
+                
+                
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
 
                 lr = self._update_lr(step, len(train_loader), epochs, self.baseline)
 
-                # ---- richer logging & printing ----
+
+                # ---- richer logging ----
                 parts_log = self._format_parts(parts, edc_val)
                 if wandb_run:
                     wandb_log = {"train/loss": float(total.item()), "train/lr": float(lr)}
                     for k, v in parts_log.items():
                         wandb_log[f"train/{k}"] = v
                     if edc_val is not None:
+                        edc_w = float(self.lambda_edc)
+                        edc_share = float((edc_w * edc_val) / (total + 1e-12))
                         wandb_log["train/edc_loss"] = float(edc_val)
+                        wandb_log["train/edc_share"] = edc_share  # NEW
                     wandb_run.log(wandb_log)
                 pbar.set_postfix({"loss": float(total.item())})
                 pbar.update(1)

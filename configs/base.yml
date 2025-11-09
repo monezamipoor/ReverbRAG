@@ -7,7 +7,7 @@ run:
   reverbrag: true           # {true | false}
   sample_rate: 48000
   epochs: 100
-  edc_loss: 0.5               # weight for EDC loss; 0.0 to disable EDC training
+  edc_loss: 0.2               # weight for EDC loss; 0.0 to disable EDC training
 
   # NEW – checkpointing & resume
   save_root: ./checkpoints          # root for run folders
@@ -16,6 +16,9 @@ run:
     checkpoint: null        # e.g., ./runs/raf/FurnishedRoom/20251106-2130_base/epoch_50.pt
     load_optimizer: false     # if true, restore optimizer state (and LR scheduler progress)
     lr_override: null         # e.g., 1e-4; if set, forces this LR after resume
+
+  # logging
+  log_every: 50               # iterations
 
 sampler:
   batch_size: 4096         # Normal batch size (Not EDC mode)

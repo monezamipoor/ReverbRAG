@@ -23,6 +23,7 @@ class ReverbRAGGenerator(nn.Module):
         super().__init__()
         # ---- read config (minimal) ----
         rag = cfg.get("reverbrag", {})
+        self._logger = None
         self.k: int = int(rag.get("k", 1))                        # we’ll still pick top-1
         self.num_bands: int = int(rag.get("num_bands", 32))       # refs_feats: [B,K,BANDS,4]
         self.mlp_hidden: List[int] = list(rag.get("mlp_hidden", [128, 256]))
@@ -58,6 +59,17 @@ class ReverbRAGGenerator(nn.Module):
 
         # Remember last seen W for sanity checks
         self._W: Optional[int] = None
+
+    def set_logger(self, logger):
+        self._logger = logger
+
+    def _safe_log(self, payload: dict):
+        # wandb-like: object with .log(dict). Accept None silently.
+        if self._logger is not None:
+            try:
+                self._logger.log(payload)
+            except Exception:
+                pass
 
     # ----------------- helpers -----------------
     @staticmethod
@@ -132,6 +144,12 @@ class ReverbRAGGenerator(nn.Module):
         z = self.norm(z)         # LayerNorm or Identity
         h = self.feat_mlp(z)     # [B, H]
         H = h.shape[-1]
+        
+        with torch.no_grad():
+            self._safe_log({
+                "rag/feat_mean": float(h.mean().item()),
+                "rag/feat_std":  float(h.std(unbiased=False).item()),
+            })
 
         # Build FiLM heads (lazy) if needed
         self._maybe_build_film_heads(W=W, h_dim=H, device=device)
@@ -146,6 +164,15 @@ class ReverbRAGGenerator(nn.Module):
 
         # Apply FiLM to all time steps
         # w_tokens: [B,T,W] -> broadcast gamma/beta over T
+        
+        with torch.no_grad():
+            self._safe_log({
+                "rag/gamma_l2": float(gamma.norm(p=2).item()/max(1.0, (B*W)**0.5)),
+                "rag/beta_l2":  float(beta.norm(p=2).item()/max(1.0, (B*W)**0.5)),
+                "rag/gamma_scale": float(self.gamma_scale.detach().item()),
+                "rag/beta_scale":  float(self.beta_scale.detach().item()),
+            })
+        
         w_out = gamma.unsqueeze(1) * w_tokens + beta.unsqueeze(1)
 
         return w_out

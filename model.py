@@ -305,6 +305,7 @@ class UnifiedReverbRAGModel(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
+        self._logger = None  # for wandb logging if needed
         aabb = getattr(cfg, "scene_aabb", None)
         aabb = aabb.clone().detach().float() if aabb is not None else torch.tensor(
             [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], dtype=torch.float32
@@ -343,6 +344,12 @@ class UnifiedReverbRAGModel(nn.Module):
         self.rag_gen = ReverbRAGGenerator(
             cfg=rag_cfg
         )
+
+    # Let Trainer inject a logger (e.g., wandb)
+    def set_logger(self, logger):
+        self._logger = logger
+        if hasattr(self.rag_gen, "set_logger"):
+            self.rag_gen.set_logger(logger)
 
     def forward(
         self,

@@ -90,28 +90,36 @@ class Trainer:
         self.evaluator = UnifiedEvaluator(fs=fs, edc_bins=60, edc_dist="l1")
 
         # ---- ReverbRAG reference bank & decay features (CPU, once) ----
-        self.ref_bank = ref_bank  # [R,1,F,60] log-mags (usually CPU)
+        self.ref_bank = ref_bank
         self.ref_bank_ids = ref_bank_ids
+
+        def _is_valid_bank(t):
+            if t is None: return False
+            if not hasattr(t, "numel"): return False
+            if t.numel() == 0: return False
+            # must be [R,1,F,60]
+            return (t.dim() == 4) and (t.shape[1] in (1,2)) and (t.shape[-1] == 60)
+
         hop_ms = (float(stftp["hop_len"]) / float(fs)) * 1000.0
-        # Handle configs where `reverbrag` is a bool (e.g., `reverbrag: true`) or a dict (`{ num_bands: 32 }`)
+
         rv_cfg = run_cfg.get("reverbrag", None)
         if isinstance(rv_cfg, dict):
             num_bands = int(rv_cfg.get("num_bands", 32))
         else:
-            # bool/None/anything else -> enabled with default bands
             num_bands = 32
 
-        if ref_feats is not None:
-            self.ref_feats = ref_feats.to(torch.float32)  # [R,B,4], float32 normalized
-        elif self.ref_bank is not None:
+        if ref_feats is not None and _is_valid_bank(self.ref_bank):
+            self.ref_feats = ref_feats.to(torch.float32)
+        elif _is_valid_bank(self.ref_bank):
             with torch.no_grad():
-                # ensure CPU numpy for deterministic Numba; compute in float64 then return float32
-                bank_np = self.ref_bank.cpu().numpy()
-                feats_np, stats = build_ref_decay_features_bank(bank_np, num_bands=num_bands, hop_ms=hop_ms)
-                # keep a copy on CPU; we’ll gather to device per batch
-                self.ref_feats = torch.from_numpy(feats_np)  # [R, B, 4], float32
-                # (optional) you can persist stats if you want; omitted here
+                bank_np = self.ref_bank.detach().cpu().numpy()   # safe for empty/invalid
+                feats_np, stats = build_ref_decay_features_bank(
+                    bank_np, num_bands=num_bands, hop_ms=hop_ms
+                )
+                self.ref_feats = torch.from_numpy(feats_np)      # [R,B,4] float32
         else:
+            # disable all ref usage cleanly
+            self.ref_bank = None
             self.ref_feats = None
 
         # Loss (different per baseline)
@@ -217,85 +225,60 @@ class Trainer:
     # ---- compact EDC loss (computed on full STFT batches only) ----
     def _edc_loss(self, pred_log: torch.Tensor, gt_log: torch.Tensor,
                 valid_mask: Optional[torch.Tensor] = None,
-                p: int = 1, eps: float = 1e-12) -> torch.Tensor:
-        """
-        Differentiable EDC loss on the 60-frame STFT grid.
-        pred_log, gt_log: [B, C, F, 60] or [B, 1, F, 60] log-magnitude.
-        Steps:
-        - mag = exp(log) - 1e-3, clamp >= 0
-        - per-frame energy: sum over F (and C if present)
-        - Schroeder: reverse cumsum over time
-        - dB, per-curve shape normalization (0 dB at t=0, unit std over valid frames)
-        - L1 (p=1) or root-L2 (p=2) over time
-        """
-        assert pred_log.dim() == 4 and gt_log.dim() == 4 and pred_log.shape[-1] == 60, \
-            "EDC loss expects full 60-frame STFT sequences."
+                p=1, eps=1e-8) -> torch.Tensor:
+        assert pred_log.shape[-1] == 60
+        # --- force fp32, no autocast ---
+        with torch.cuda.amp.autocast(enabled=False):
+            pred_log32 = pred_log.float()
+            gt_log32   = gt_log.float()
 
-        # magnitudes
-        pred_mag = (pred_log.exp() - 1e-3).clamp_min(0.0)
-        gt_mag   = (gt_log.exp()   - 1e-3).clamp_min(0.0)
+            pred_mag = (pred_log32.exp() - 1e-3).clamp_min(0.0)
+            gt_mag   = (gt_log32.exp()   - 1e-3).clamp_min(0.0)
 
-        # energy over frequency (and channel)
-        E_pred = (pred_mag ** 2).sum(dim=-2)  # [B,C,60]
-        E_gt   = (gt_mag   ** 2).sum(dim=-2)
-        if E_pred.dim() == 3:
-            E_pred = E_pred.sum(dim=-3)      # [B,60]
-            E_gt   = E_gt.sum(dim=-3)        # [B,60]
+            E_pred = (pred_mag**2).sum(dim=-2)
+            E_gt   = (gt_mag**2).sum(dim=-2)
+            if E_pred.dim() == 3:
+                E_pred = E_pred.sum(dim=-3)
+                E_gt   = E_gt.sum(dim=-3)
 
-        # Schroeder (reverse cumsum)
-        S_pred = torch.flip(torch.cumsum(torch.flip(E_pred, dims=[-1]), dim=-1), dims=[-1])
-        S_gt   = torch.flip(torch.cumsum(torch.flip(E_gt,   dims=[-1]), dim=-1), dims=[-1])
+            S_pred = torch.flip(torch.cumsum(torch.flip(E_pred, dims=[-1]), dim=-1), dims=[-1])
+            S_gt   = torch.flip(torch.cumsum(torch.flip(E_gt,   dims=[-1]), dim=-1), dims=[-1])
 
-        # dB
-        s_pred = 10.0 * torch.log10(S_pred + eps)
-        s_gt   = 10.0 * torch.log10(S_gt   + eps)
+            # clamp BEFORE log10, in fp32
+            floor = 1e-8
+            s_pred = 10.0 * torch.log10(S_pred.clamp_min(floor))
+            s_gt   = 10.0 * torch.log10(S_gt  .clamp_min(floor))
 
-        # shape normalization per-curve: zero at t0, unit std on valid frames
-        B, T = s_pred.shape
-        if valid_mask is None:
-            valid_mask = torch.ones(B, T, dtype=torch.bool, device=s_pred.device)
+            B, T = s_pred.shape
+            if valid_mask is None:
+                valid_mask = torch.ones(B, T, dtype=torch.bool, device=s_pred.device)
 
-        s_pred = s_pred - s_pred[:, :1]
-        s_gt   = s_gt   - s_gt[:, :1]
+            s_pred = s_pred - s_pred[:, :1]
+            s_gt   = s_gt   - s_gt[:, :1]
 
-        def _std_over_valid(x, m):
-            cnt = m.sum(dim=-1, keepdim=True).clamp_min(1)
-            mu  = (x * m).sum(dim=-1, keepdim=True) / cnt
-            var = ((x - mu) ** 2 * m).sum(dim=-1, keepdim=True) / cnt
-            return torch.sqrt(var + eps)
+            # z-score on valid frames (safe)
+            cnt = valid_mask.sum(dim=-1, keepdim=True).clamp_min(1)
+            def _std(x, m):
+                mu = (x * m).sum(dim=-1, keepdim=True) / cnt
+                var = ((x - mu)**2 * m).sum(dim=-1, keepdim=True) / cnt
+                return torch.sqrt(var.clamp_min(1e-8))
+            s_pred = s_pred / _std(s_pred, valid_mask)
+            s_gt   = s_gt   / _std(s_gt,   valid_mask)
 
-        std_p = _std_over_valid(s_pred, valid_mask)
-        std_g = _std_over_valid(s_gt,   valid_mask)
-        s_pred = s_pred / std_p
-        s_gt   = s_gt   / std_g
+            diff = (s_pred - s_gt) * valid_mask
+            if p == 1:
+                per_s = diff.abs().sum(dim=-1) / cnt.squeeze(-1)
+                return per_s.mean()
+            else:
+                per_s = diff.pow(2).sum(dim=-1) / cnt.squeeze(-1)
+                return torch.sqrt(per_s.clamp_min(1e-8)).mean()
 
-        # distance
-        diff = (s_pred - s_gt) * valid_mask
-        if p == 1:
-            per_t = diff.abs()
-            per_s = per_t.sum(dim=-1) / valid_mask.sum(dim=-1).clamp_min(1)
-            return per_s.mean()
-        else:  # p == 2
-            per_t = diff.pow(2)
-            per_s = per_t.sum(dim=-1) / valid_mask.sum(dim=-1).clamp_min(1)
-            return torch.sqrt(per_s + eps).mean()
-
-
-    def _loss(self, pred_log, gt_log, dataset_mode: str):
+    def _loss(self, pred_log, gt_log):
         pred_log = pred_log.float(); gt_log = gt_log.float()
         if self.baseline == "neraf":
             parts = self.loss_fn(pred_log, gt_log)  # dict: audio_sc_loss, audio_mag_loss
             total = 0.1 * parts["audio_sc_loss"] + 1.0 * parts["audio_mag_loss"]
-            edc_val = None
-            if self.lambda_edc > 0.0:
-                if self.use_edc_full and dataset_mode == "full":
-                    edc_term = self._edc_loss(pred_log, gt_log)
-                    total = total + self.lambda_edc * edc_term
-                    edc_val = edc_term.detach()
-                elif self.use_edc_full and dataset_mode != "full" and not self._warned_slice_edc:
-                    print("[warn] edc_full=True but dataset_mode!='full' → skipping EDC loss on slices.")
-                    self._warned_slice_edc = True
-            return total, parts, edc_val
+            return total, parts, None
         # AV-NeRF fallback: single MSE on log-mags
         mse = F.mse_loss(pred_log, gt_log)
         return mse, {"mse": mse.detach()}, None
@@ -393,7 +376,7 @@ class Trainer:
                 pred = self._forward_batch(batch, mode_full=not is_slice)
 
                 # spectral loss (pass a string or bool to keep API simple)
-                total, parts, edc_val = self._loss(pred, gt, "slice" if is_slice else "full")
+                total, parts, edc_val = self._loss(pred, gt)
 
                 # inside train() loop, after total, parts, edc_val = self._loss(...)
                 if self.lambda_edc > 0.0:
@@ -463,7 +446,7 @@ class Trainer:
         e_sum, n = None, 0
         for batch in tqdm(val_loader, desc="[eval]", leave=False):
             gt = batch["stft"].to(self.device).float()  # [B,1,F,60] or [B,2,F,60]
-            pred = self._forward_batch(batch, dataset_mode="full")
+            pred = self._forward_batch(batch, mode_full="full")
             m = self.evaluator.evaluate(pred, gt)
             if e_sum is None:
                 e_sum = {k: float(v) for k, v in m.items()}

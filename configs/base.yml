@@ -1,19 +1,13 @@
 seed: 42
 
-sampler:
-  batch_size: 4096         # Normal batch size (Not EDC mode)
-  rirs_per_batch: 40       # only for EDC mode
-  shuffle: true
-  num_workers: 8
-
 run:
-  model: avnerf                # {neraf | avnerf}
+  model: neraf                # {neraf | avnerf}
   database: raf               # {raf | soundspaces}
   scene: FurnishedRoom        # e.g., EmptyRoom, FurnishedRoom
   reverbrag: true           # {true | false}
   sample_rate: 48000
   epochs: 100
-  edc_loss: 0.5
+  edc_loss: 0.5               # weight for EDC loss; 0.0 to disable EDC training
 
   # NEW – checkpointing & resume
   save_root: ./checkpoints          # root for run folders
@@ -22,6 +16,12 @@ run:
     checkpoint: null        # e.g., ./runs/raf/FurnishedRoom/20251106-2130_base/epoch_50.pt
     load_optimizer: false     # if true, restore optimizer state (and LR scheduler progress)
     lr_override: null         # e.g., 1e-4; if set, forces this LR after resume
+
+sampler:
+  batch_size: 4096         # Normal batch size (Not EDC mode)
+  rirs_per_batch: 40       # only for EDC mode
+  shuffle: true
+  num_workers: 8
 
 wandb:
   project: ReverbRAG
@@ -41,7 +41,7 @@ reverbrag:
 
   # reference MLP over 32x4 features
   mlp_hidden: [128, 256, 256]
-  mlp_act: gelu             # {gelu | relu | lrelu | silu}
+  mlp_act: lrelu             # {gelu | relu | lrelu | silu}
   feature_norm: "layernorm"
 
   # FiLM parameters

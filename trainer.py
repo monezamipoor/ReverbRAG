@@ -4,6 +4,7 @@ from copy import deepcopy
 import os
 from typing import Dict, Any, Optional
 
+from decay_features import build_ref_decay_features_bank
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -100,7 +101,8 @@ class Trainer:
         baseline: str,
         visual_feat_builder,   # callable(batch, B)-> Tensor [B, Dv]
         stft_params: Optional[Dict[str, int]] = None,
-        ref_bank: torch.Tensor = None, ref_bank_ids=None
+        ref_bank: torch.Tensor = None, ref_bank_ids=None,
+        ref_feats: torch.Tensor = None,
     ):
         self.model = model.to(device)
         self.device = device
@@ -118,6 +120,31 @@ class Trainer:
             power=1,
         ).to(device)
         self.evaluator = UnifiedEvaluator(fs=fs, edc_bins=60, edc_dist="l1")
+
+        # ---- ReverbRAG reference bank & decay features (CPU, once) ----
+        self.ref_bank = ref_bank  # [R,1,F,60] log-mags (usually CPU)
+        self.ref_bank_ids = ref_bank_ids
+        hop_ms = (float(stftp["hop_len"]) / float(fs)) * 1000.0
+        # Handle configs where `reverbrag` is a bool (e.g., `reverbrag: true`) or a dict (`{ num_bands: 32 }`)
+        rv_cfg = run_cfg.get("reverbrag", None)
+        if isinstance(rv_cfg, dict):
+            num_bands = int(rv_cfg.get("num_bands", 32))
+        else:
+            # bool/None/anything else -> enabled with default bands
+            num_bands = 32
+
+        if ref_feats is not None:
+            self.ref_feats = ref_feats.to(torch.float32)  # [R,B,4], float32 normalized
+        elif self.ref_bank is not None:
+            with torch.no_grad():
+                # ensure CPU numpy for deterministic Numba; compute in float64 then return float32
+                bank_np = self.ref_bank.cpu().numpy()
+                feats_np, stats = build_ref_decay_features_bank(bank_np, num_bands=num_bands, hop_ms=hop_ms)
+                # keep a copy on CPU; we’ll gather to device per batch
+                self.ref_feats = torch.from_numpy(feats_np)  # [R, B, 4], float32
+                # (optional) you can persist stats if you want; omitted here
+        else:
+            self.ref_feats = None
 
         # Loss (different per baseline)
         if self.baseline == "neraf":
@@ -183,6 +210,18 @@ class Trainer:
         )  # [B,K,1,F,60]
         return refs.to(self.device, non_blocking=True), mask.to(self.device)
 
+    def _gather_ref_feats(self, ref_idx: torch.Tensor):
+        """
+        ref_idx: [B,K] long -> returns [B,K,BANDS,4] float32 on device
+        """
+        if (ref_idx is None) or (self.ref_feats is None):
+            return None
+        idx = ref_idx.clone()
+        idx[idx < 0] = 0
+        flat = idx.view(-1)
+        gathered = self.ref_feats.index_select(0, flat.cpu())  # [B*K, BANDS, 4] on CPU
+        return gathered.view(*idx.shape, self.ref_feats.shape[1], 4).to(self.device, non_blocking=True)
+
     def _forward_batch(self, batch: Dict[str, torch.Tensor], dataset_mode: str):
         full = (dataset_mode == "full")
         mic = batch["receiver_pos"].to(self.device).float()
@@ -194,15 +233,17 @@ class Trainer:
 
         # ---- ReverbRAG refs for this batch (optional) ----
         ref_idx = batch.get("ref_indices", None)
-        refs_logmag = refs_mask = None
+        refs_logmag = refs_mask = refs_feats = None
         if ref_idx is not None:
             refs_logmag, refs_mask = self._gather_refs(ref_idx)
+            refs_feats = self._gather_ref_feats(ref_idx)
 
         with autocast(True):
             pred = self.model(
                 mic_xyz=mic, src_xyz=src, head_dir=head, t_idx=t_idx,
                 visual_feat=vfeat,
-                refs_logmag=refs_logmag, refs_mask=refs_mask,    # <— NEW
+                refs_logmag=refs_logmag, refs_mask=refs_mask,    # <— existing
+                refs_feats=refs_feats,                            # <— NEW
             )
         return pred
 

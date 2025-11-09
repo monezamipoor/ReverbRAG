@@ -335,9 +335,10 @@ class UnifiedReverbRAGModel(nn.Module):
                                     n_channels=self.n_channels, dir_cond_dim=dir_cond_dim)
         
         # ---- ReverbRAG (lightweight placeholder for now) ----
-        self.use_rag = True    # trainer/builder can rely on dataset+bank existence
+        self.use_rag = True
+        rag_cfg = getattr(cfg, "reverbrag", {}) if hasattr(cfg, "reverbrag") else {}
         self.rag_gen = ReverbRAGGenerator(
-            n_freq=self.N_freq, W=cfg.W_field, mode="passthrough"
+            n_freq=self.N_freq, W=cfg.W_field, mode="film_fuse", rag_cfg=rag_cfg
         )
 
     def forward(
@@ -349,11 +350,12 @@ class UnifiedReverbRAGModel(nn.Module):
         visual_feat: torch.Tensor,
         refs_logmag: torch.Tensor = None,     # [B,K,1,F,60] log-mag
         refs_mask: torch.Tensor = None,       # [B,K] (bool)
+        refs_feats: torch.Tensor = None,          # [B,K,BANDS,4] decay features (not used yet)
     ) -> torch.Tensor:
         if self.encoder_kind == "neraf":
             w = self.encoder(mic_xyz, src_xyz, head_dir, t_idx, visual_feat, self.aabb)  # [B,T,W]
             # (for now) just let generator optionally pre-process w / refs and return a (maybe) modified w
-            w = self.rag_gen.pre_fuse(w, refs_logmag, refs_mask) if self.use_rag else w
+            w = self.rag_gen.pre_fuse(w, refs_logmag, refs_mask, refs_feats) if self.use_rag else w
             return self.decoder(w)
 
         # AV-NeRF path
@@ -361,5 +363,5 @@ class UnifiedReverbRAGModel(nn.Module):
         B, T = t_idx.shape[0], t_idx.shape[1]
         rot_e = self.rot_encoding(head_dir).unsqueeze(1).expand(B, T, -1).contiguous()
         # same pre-fuse hook
-        w = self.rag_gen.pre_fuse(w, refs_logmag, refs_mask) if self.use_rag else w
+        w = self.rag_gen.pre_fuse(w, refs_logmag, refs_mask, refs_feats) if self.use_rag else w
         return self.decoder(w, dir_cond=rot_e)

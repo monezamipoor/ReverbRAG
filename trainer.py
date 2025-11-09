@@ -190,12 +190,11 @@ class Trainer:
         gathered = self.ref_feats.index_select(0, flat.cpu())  # [B*K, BANDS, 4] on CPU
         return gathered.view(*idx.shape, self.ref_feats.shape[1], 4).to(self.device, non_blocking=True)
 
-    def _forward_batch(self, batch: Dict[str, torch.Tensor], dataset_mode: str):
-        full = (dataset_mode == "full")
-        mic = batch["receiver_pos"].to(self.device).float()
-        src = batch["source_pos"].to(self.device).float()
+    def _forward_batch(self, batch: Dict[str, torch.Tensor], mode_full: bool):
+        mic  = batch["receiver_pos"].to(self.device).float()
+        src  = batch["source_pos"].to(self.device).float()
         head = batch["orientation"].to(self.device).float()
-        t_idx = self._make_t_idx(batch, self.device, full)
+        t_idx = self._make_t_idx(batch, self.device, mode_full)
         B = mic.shape[0]
         vfeat = self.visual_feat_builder(batch, B).to(self.device).float()
 
@@ -328,12 +327,9 @@ class Trainer:
         self.optimizer.param_groups[0]["lr"] = lr
         return lr
 
+    # inside Trainer class
+    @staticmethod
     def _pack_slices_to_full(x: torch.Tensor, T: int) -> torch.Tensor:
-        """
-        x: [B*T, C, F, 1]  ->  [B, C, F, T]
-        Requires that the dataloader groups slices per SID contiguously in time
-        (EDCFullBatchSampler does this).
-        """
         B = x.shape[0] // T
         return (
             x.view(B, T, x.shape[1], x.shape[2], x.shape[3])  # [B,T,C,F,1]
@@ -366,10 +362,15 @@ class Trainer:
 
     # ------------------------- API -------------------------
     def train(
-        self, train_loader, val_loader, dataset_mode: str, epochs: int, wandb_run=None,
+        self, train_loader, val_loader, epochs: int, wandb_run=None,
         save_dir: str = None, save_every: int = 10, cfg_copy_path: str = None,
         resume_ckpt: str = None, resume_load_optimizer: bool = False, resume_lr_override=None,
     ):
+        # one-time: say which sampler we actually have
+        bs_obj = getattr(train_loader, "batch_sampler", None)
+        sampler_name = type(bs_obj).__name__ if bs_obj is not None else type(train_loader.sampler).__name__
+        print(f"[train] using sampler={sampler_name}")
+
         # ---- optional resume ----
         if resume_ckpt:
             self.load_checkpoint(
@@ -383,32 +384,46 @@ class Trainer:
         for epoch in range(1, epochs + 1):
             pbar = tqdm(total=len(train_loader), desc=f"[train] epoch {epoch}", leave=False)
             for batch in train_loader:
-                gt = (batch["stft"] if dataset_mode == "full" else batch["stft_slice"]).to(self.device).float()
-                if dataset_mode != "full":
-                    gt = gt.unsqueeze(-1)  # [B*T, 1, F, 1] logically
+                # infer mode: slice batches carry 'stft_slice'
+                is_slice = ("stft_slice" in batch)
+                gt = (batch["stft_slice"] if is_slice else batch["stft"]).to(self.device).float()
+                if is_slice:
+                    gt = gt.unsqueeze(-1)  # [B*T, 1, F, 1]
 
-                pred = self._forward_batch(batch, dataset_mode)
-                if pred.dtype != gt.dtype:
-                    pred = pred.to(gt.dtype)
+                pred = self._forward_batch(batch, mode_full=not is_slice)
 
-                # --- normal spectral parts ---
-                total, parts, edc_val = self._loss(pred, gt, dataset_mode)
+                # spectral loss (pass a string or bool to keep API simple)
+                total, parts, edc_val = self._loss(pred, gt, "slice" if is_slice else "full")
 
                 # inside train() loop, after total, parts, edc_val = self._loss(...)
-                if self.lambda_edc > 0.0 and getattr(train_loader.sampler, "__class__", None).__name__ != "EDCFullBatchSampler":
-                    print("[warn] EDC loss expects EDCFullBatchSampler (contiguous T slices per SID).")
                 if self.lambda_edc > 0.0:
-                    T = getattr(train_loader.dataset, "max_frames", None)  # expect 60
-                    if T is not None and (gt.shape[0] % T == 0):
-                        pred_full = self._pack_slices_to_full(pred, T)
-                        gt_full   = self._pack_slices_to_full(gt,   T)
-                        edc_term  = self._edc_loss(pred_full, gt_full, valid_mask=None, p=1)
+                    bs_obj = getattr(train_loader, "batch_sampler", None)
+                    sampler_name = type(bs_obj).__name__ if bs_obj is not None else type(train_loader.sampler).__name__
+
+                    if is_slice:
+                        # require contiguous T slices per SID to pack
+                        if sampler_name != "EDCFullBatchSampler":
+                            if not getattr(self, "_warned_sampler", False):
+                                print("[warn] EDC loss expects EDCFullBatchSampler (contiguous T slices per SID).")
+                                self._warned_sampler = True
+                        else:
+                            T = int(getattr(train_loader.dataset, "max_frames", 60))
+                            if (gt.shape[0] % T) == 0:
+                                pred_full = self._pack_slices_to_full(pred, T)
+                                gt_full   = self._pack_slices_to_full(gt,   T)
+                                edc_term  = self._edc_loss(pred_full, gt_full, valid_mask=None, p=1)
+                                total = total + self.lambda_edc * edc_term
+                                edc_val = edc_term.detach()
+                            else:
+                                if not getattr(self, "_warned_slice_edc", False):
+                                    print("[warn] cannot pack slices (batch not multiple of T). Skipping EDC term this step.")
+                                    self._warned_slice_edc = True
+                    else:
+                        # full batches: compute EDC directly (already full 60 frames)
+                        edc_term = self._edc_loss(pred, gt, valid_mask=None, p=1)
                         total = total + self.lambda_edc * edc_term
                         edc_val = edc_term.detach()
-                    else:
-                        if not self._warned_slice_edc:
-                            print("[warn] cannot pack slices into full T=60 — skipping EDC term this step.")
-                            self._warned_slice_edc = True
+
 
                 self.optimizer.zero_grad(set_to_none=True)
                 self.scaler.scale(total).backward()
@@ -458,12 +473,4 @@ class Trainer:
             n += 1
         self.model.train()
         return {k: (v / max(1, n)) for k, v in e_sum.items()}
-
-    def save_model(self, path: str, extra: Optional[Dict[str, Any]] = None):
-        state = {
-            "model": self.model.state_dict(),
-            "baseline": self.baseline,
-        }
-        if extra:
-            state.update(extra)
-        torch.save(state, path)
+    

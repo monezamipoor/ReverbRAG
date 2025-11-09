@@ -8,6 +8,8 @@ import yaml
 import random
 import numpy as np
 from typing import Dict, Any
+from typing import Optional
+import math
 
 import torch
 from torch.utils.data import DataLoader, get_worker_info
@@ -33,70 +35,135 @@ def _worker_init_fn(_):
         try: info.dataset._cache.clear()
         except Exception: info.dataset._cache = {}
 
-def _build_loader(cfg: Dict[str, Any], dataset, force_full: bool = False):
-    sc = copy.deepcopy(cfg.get("sampler", {}))
-    if force_full:
-        sc["dataset_mode"] = "full"
-        sc["batching"] = "random"
+# --- add these helper builders somewhere above main() ---
 
-    dataset_mode = sc.get("dataset_mode", "full").lower()
-    batching = sc.get("batching", "random").lower()
-    bs = int(sc.get("batch_size", 4))
+def build_train_loader(cfg, dataset):
+    """
+    Train loader:
+      - Always SLICE mode for train.
+      - If run.edc_loss > 0: force EDCFullBatchSampler with rirs_per_batch knob.
+      - Else: RandomSliceBatchSampler with 'batch_size' (slices).
+    Prints clear diagnostics and estimated steps/epoch.
+    """
+    sc   = copy.deepcopy(cfg.get("sampler", {}))
+    run  = cfg.get("run", {}) or {}
+    edc_w = float(run.get("edc_loss", 0.0))  # your config key
+    shuffle      = bool(sc.get("shuffle", True))
+    num_workers  = int(sc.get("num_workers", 0))
+    use_persist  = num_workers > 0
+
+    T = int(getattr(dataset, "max_frames", 60))
+    total_slices = len(dataset)
+    est_num_rirs = total_slices // T
+
+    if edc_w > 0.0:
+        # EDC mode: use RIRs-per-batch knob
+        rpb = int(sc.get("rirs_per_batch", 40))
+        bs_slices = rpb * T
+        batch_sampler = EDCFullBatchSampler(
+            ids=dataset.ids,
+            max_frames=T,
+            batch_size_rirs=rpb,
+            drop_last=False,
+            shuffle=shuffle,
+        )
+        loader = DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=use_persist,
+            worker_init_fn=_worker_init_fn,
+        )
+        steps = max(1, math.ceil(est_num_rirs / max(1, rpb)))
+        print(f"[dataloader][TRAIN] mode=SLICE | sampler=EDCFullBatchSampler | T={T} | "
+              f"rirs_per_batch={rpb} | bs={bs_slices} (slices) | workers={num_workers} | shuffle={shuffle}")
+        print(f"[dataset][TRAIN] slices={total_slices} ≈ RIRs={est_num_rirs} | ~steps/epoch={steps}")
+        return loader
+
+    # Non-EDC mode: batch by raw slices
+    bs_slices = int(sc.get("batch_size", 4096))
+    batch_sampler = RandomSliceBatchSampler(
+        len(dataset), batch_size=bs_slices, drop_last=False, shuffle=shuffle
+    )
+    loader = DataLoader(
+        dataset,
+        batch_sampler=batch_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=use_persist,
+        worker_init_fn=_worker_init_fn,
+    )
+    steps = max(1, math.ceil(total_slices / max(1, bs_slices)))
+    print(f"[dataloader][TRAIN] mode=SLICE | sampler=RandomSliceBatchSampler | bs={bs_slices} (slices) | "
+          f"workers={num_workers} | shuffle={shuffle}")
+    print(f"[dataset][TRAIN] slices={total_slices} ≈ RIRs={est_num_rirs} | ~steps/epoch={steps}")
+    return loader
+
+
+def build_eval_loader(cfg, dataset):
+    """
+    Val/Test loader:
+      - Always FULL mode (no EDC packing here).
+      - Uses sampler.batch_size if present (default 2048).
+    """
+    sc  = copy.deepcopy(cfg.get("sampler", {}))
+    bs  = int(sc.get("batch_size", 2048))
     shuffle = bool(sc.get("shuffle", True))
     num_workers = int(sc.get("num_workers", 0))
     use_persist = num_workers > 0
 
-    if dataset_mode == "full":
-        if batching == "edc_full":
-            raise ValueError("edc_full batching requires dataset_mode='slice'.")
-        loader = DataLoader(
-            dataset, batch_size=bs, shuffle=shuffle, num_workers=num_workers,
-            pin_memory=True, persistent_workers=use_persist, worker_init_fn=_worker_init_fn,
-            drop_last=False,
-        )
-        return loader, dataset_mode
-
-    # slice mode with custom samplers
-    if batching == "random":
-        batch_sampler = RandomSliceBatchSampler(len(dataset), batch_size=bs, drop_last=False, shuffle=shuffle)
-    elif batching == "edc_full":
-        batch_sampler = EDCFullBatchSampler(
-            ids=dataset.ids, max_frames=dataset.max_frames,
-            batch_size_rirs=bs, drop_last=False, shuffle=shuffle
-        )
-    else:
-        raise ValueError(f"Unknown batching mode '{batching}'")
-
     loader = DataLoader(
-        dataset, batch_sampler=batch_sampler, num_workers=num_workers,
-        pin_memory=True, persistent_workers=use_persist, worker_init_fn=_worker_init_fn,
+        dataset,
+        batch_size=bs,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=use_persist,
+        worker_init_fn=_worker_init_fn,
+        drop_last=False,
     )
-    return loader, dataset_mode
+    print(f"[dataloader][EVAL ] mode=FULL | bs={bs} | workers={num_workers} | shuffle={shuffle}")
+    return loader
 
-def build_visual_feat_builder(baseline: str):
+# ---------------------------------
+
+
+
+def build_visual_feat_builder(baseline: str, neraf_global_vec: Optional[torch.Tensor]):
     """
-    Returns a callable batch->visual_feat:
-      - AV-NeRF: concat per-pose features if present (feat_rgb, feat_depth).
-      - NeRAF  : use global 1024-D; dataset already expands to per-item in RAFDataset.
-                 We simply fall back to (1x1024)->repeat if needed.
+    Strict visual feature wiring (no fallbacks):
+      - AV-NeRF: require per-pose feats in batch (feat_rgb and/or feat_depth). If both missing -> raise.
+      - NeRAF : require a global scene feature vector (e.g., 1024-D) passed in; expand to (B, D).
     """
     def _builder(batch, B):
         if baseline == "avnerf":
             feats = []
-            if "feat_rgb" in batch and batch["feat_rgb"].numel() > 0: feats.append(batch["feat_rgb"])
-            if "feat_depth" in batch and batch["feat_depth"].numel() > 0: feats.append(batch["feat_depth"])
+            f_rgb = batch.get("feat_rgb", None)
+            f_dep = batch.get("feat_depth", None)
+            if f_rgb is not None and f_rgb.numel() > 0:
+                feats.append(f_rgb)
+            if f_dep is not None and f_dep.numel() > 0:
+                feats.append(f_dep)
             if len(feats) == 0:
-                # fallback: zeros if per-pose features are absent
-                return torch.zeros(B, 0)
+                raise RuntimeError(
+                    "[AV-NeRF] Missing per-pose visual features in batch: expected 'feat_rgb' and/or 'feat_depth'. "
+                    "Check your RAFDataset build for this split."
+                )
             return torch.cat(feats, dim=-1)
-        # NeRAF (global 1024 already expanded in dataset build or cached per sid)
-        # If your dataset returns nothing, just zeros(1024).
-        f = batch.get("feat_rgb", None)  # RAFDataset does not provide global.pt here
-        if f is None or f.numel() == 0:
-            return torch.zeros(B, 1024)
-        return f
+
+        # NeRAF path: must have a single global scene context vector loaded beforehand
+        if neraf_global_vec is None:
+            raise RuntimeError(
+                "[NeRAF] Global scene feature vector is None. "
+                "Expected to load from <root>/<scene>/feats/global.pt before training."
+            )
+        if neraf_global_vec.ndim != 1:
+            raise RuntimeError(f"[NeRAF] global.pt must be 1-D (got {neraf_global_vec.shape}).")
+        D = neraf_global_vec.numel()
+        return neraf_global_vec.view(1, D).expand(B, D).to(batch["stft_slice"].device if "stft_slice" in batch else batch["stft"].device)
+
     return _builder
-# ---------------------------------
 
 
 def main():
@@ -118,7 +185,7 @@ def main():
     scene = run.get("scene", "FurnishedRoom")
     fs = int(run.get("sample_rate", 48000))
     epochs = int(run.get("epochs", 20))
-
+    
     # Databases roots
     dbs = cfg.get("databases", {})
     if database == "raf":
@@ -129,20 +196,49 @@ def main():
         raise ValueError(f"Unknown database {database}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Fetch Visual Features for each baseline
+    neraf_global_vec = None
+    if baseline == "neraf":
+        global_path = os.path.join(root, scene, "feats", "global.pt")  # e.g. ../NeRAF/data/RAF/EmptyRoom/feats/global.pt
+        if not os.path.isfile(global_path):
+            raise FileNotFoundError(f"[NeRAF] Required global feature file not found: {global_path}")
+        obj = torch.load(global_path, map_location="cpu")
+        if isinstance(obj, dict) and "global" in obj:
+            obj = obj["global"]
+        if not torch.is_tensor(obj):
+            raise RuntimeError(f"[NeRAF] {global_path} must contain a 1-D tensor (or dict['global']). Got: {type(obj)}.")
+        if obj.ndim != 1:
+            raise RuntimeError(f"[NeRAF] {global_path} must be 1-D. Got shape: {tuple(obj.shape)}.")
+        neraf_global_vec = obj.float()
+        print(f"[features] Loaded NeRAF global feature {tuple(neraf_global_vec.shape)} from {global_path}")
 
     # --------- Build datasets/loaders ----------
-    train_ds = build_dataset(cfg, split="train")
-    train_loader, dataset_mode = _build_loader(cfg, train_ds, force_full=False)
-    ref_bank = getattr(train_ds, "ref_bank_stft", torch.empty(0))
-    ref_bank_ids = getattr(train_ds, "ref_bank_ids", [])
 
-    # Val: force dataset_mode='full' as requested
+    # TRAIN: always SLICE dataset; loader auto-picks EDC sampler if edc_loss>0
+    train_cfg = copy.deepcopy(cfg)
+    train_cfg.setdefault("sampler", {})
+    train_cfg["sampler"]["dataset_mode"] = "slice"   # ensure dataset yields time slices
+    train_ds = build_dataset(train_cfg, split="train")
+    train_loader = build_train_loader(cfg, train_ds)  # our build_train_loader ignores dataset_mode and is EDC-aware
+
+    # VAL: always FULL dataset + FULL loader (batch_size from val_cfg)
     val_cfg = copy.deepcopy(cfg)
     val_cfg.setdefault("sampler", {})
     val_cfg["sampler"]["dataset_mode"] = "full"
     val_cfg["sampler"]["batch_size"] = 2048
     val_ds = build_dataset(val_cfg, split="validation")
-    val_loader, _ = _build_loader(val_cfg, val_ds, force_full=True)
+    val_loader = build_eval_loader(val_cfg, val_ds)   # <-- pass val_cfg, not cfg
+
+    # (Optional) TEST: same as VAL if you have it
+    # test_cfg = copy.deepcopy(val_cfg)
+    # test_ds = build_dataset(test_cfg, split="test")
+    # test_loader = build_eval_loader(test_cfg, test_ds)
+
+    # Reference bank (from the train dataset)
+    ref_bank = getattr(train_ds, "ref_bank_stft", torch.empty(0))
+    ref_bank_ids = getattr(train_ds, "ref_bank_ids", [])
+
 
     # --------- Build model ----------
     mcfg = ModelConfig(
@@ -154,7 +250,7 @@ def main():
 
     # --------- Trainer ----------
     stft_params = fs_to_stft_params(fs)
-    visual_builder = build_visual_feat_builder(baseline)
+    visual_builder = build_visual_feat_builder(baseline, neraf_global_vec)
     trainer = Trainer(
         model=model,
         opt_cfg={},                 # not needed (kept for future)
@@ -201,7 +297,6 @@ def main():
     # --------- Train + Eval + internal checkpointing ----------
     trainer.train(
         train_loader, val_loader,
-        dataset_mode=dataset_mode,
         epochs=epochs,
         wandb_run=wandb_run,
         save_dir=out_dir,

@@ -1,13 +1,15 @@
 seed: 42
 
-wandb:
-  project: ReverbRAG
-  api_key: null    # optional; leave null if you've already `wandb login`
+sampler:
+  batch_size: 4096         # Normal batch size (Not EDC mode)
+  rirs_per_batch: 40       # only for EDC mode
+  shuffle: true
+  num_workers: 8
 
 run:
   model: avnerf                # {neraf | avnerf}
   database: raf               # {raf | soundspaces}
-  scene: EmptyRoom        # e.g., EmptyRoom, FurnishedRoom
+  scene: FurnishedRoom        # e.g., EmptyRoom, FurnishedRoom
   reverbrag: true           # {true | false}
   sample_rate: 48000
   epochs: 100
@@ -21,12 +23,10 @@ run:
     load_optimizer: false     # if true, restore optimizer state (and LR scheduler progress)
     lr_override: null         # e.g., 1e-4; if set, forces this LR after resume
 
-sampler:
-  dataset_mode: slice      # {full | slice}
-  batching: edc_full       # {random | edc_full}
-  batch_size: 40            # if edc_full: 4 RIRs -> 4*60 slices per batch ()
-  shuffle: true
-  num_workers: 8
+wandb:
+  project: ReverbRAG
+  api_key: null    # optional; leave null if you've already `wandb login`
+
 
 databases:
   raf:

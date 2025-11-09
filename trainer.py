@@ -336,18 +336,23 @@ class Trainer:
         mod = getattr(self.model, submodule_name, None)
         if mod is None:
             return 0.0
-        sq = 0.0
+
+        total_sq, count = 0.0, 0
         for p in mod.parameters():
             if p.grad is not None:
-                sq += float(p.grad.detach().pow(2).sum().item())
-        return (sq ** 0.5)
+                g = p.grad.detach()
+                total_sq += float(g.pow(2).sum().item())
+                count += g.numel()
+        return (total_sq / max(count, 1)) ** 0.5  # RMS grad
 
     def _grad_norm_total(self) -> float:
-        sq = 0.0
+        total_sq, count = 0.0, 0
         for p in self.model.parameters():
             if p.grad is not None:
-                sq += float(p.grad.detach().pow(2).sum().item())
-        return (sq ** 0.5)
+                g = p.grad.detach()
+                total_sq += float(g.pow(2).sum().item())
+                count += g.numel()
+        return (total_sq / max(count, 1)) ** 0.5
 
     def load_checkpoint(self, path: str, load_optimizer: bool = False, lr_override=None):
         chk = torch.load(path, map_location=self.device)

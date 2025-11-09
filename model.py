@@ -338,11 +338,9 @@ class UnifiedReverbRAGModel(nn.Module):
         # ---- ReverbRAG (lightweight placeholder for now) ----
         self.use_rag = True
         rag_cfg = getattr(cfg, "reverbrag", {}) if hasattr(cfg, "reverbrag") else {}
-        # self.rag_gen = ReverbRAGGenerator(
-        #     n_freq=self.N_freq, W=cfg.W_field, mode="film_fuse", rag_cfg=rag_cfg
-        # )
         self.rag_gen = ReverbRAGGenerator(
-            cfg=rag_cfg
+            cfg=rag_cfg,
+            W=cfg.W_field,   # <— pass token width so FiLM/Gate params are created BEFORE optimizer
         )
 
     # Let Trainer inject a logger (e.g., wandb)

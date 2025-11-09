@@ -40,38 +40,6 @@ class STFTLoss(nn.Module):
         y_mag = torch.exp(y_log) - 1e-3
         return {'audio_sc_loss': self.sc(x_mag, y_mag),
                 'audio_mag_loss': self.lm(x_log, y_log)}
-# -------------------------------------------------------------------
-
-# ---- compact EDC loss (computed on full STFT batches only) ----
-# inside class Trainer
-def _edc_loss(self, pred_log: torch.Tensor, gt_log: torch.Tensor) -> torch.Tensor:
-    """
-    EDC loss on full STFT sequences (shape [B,C,F,T] or [B,1,F,T]):
-      1) frame energy: sum over frequency (and channels)
-      2) Schroeder integral: reverse cumulative sum over time
-      3) L1 in log10 space between curves
-    """
-    assert pred_log.dim() == 4 and gt_log.dim() == 4 and pred_log.shape[-1] > 1, \
-        "EDC needs full time context (T>1)."
-
-    # mag
-    pred_mag = (pred_log.exp() - 1e-3).clamp_min(0.0)
-    gt_mag   = (gt_log.exp()   - 1e-3).clamp_min(0.0)
-
-    # sum over F, then (if present) over channel
-    pred_e = pred_mag.pow(2).sum(dim=-2)   # [B,C,T]
-    gt_e   = gt_mag.pow(2).sum(dim=-2)
-    if pred_e.dim() == 3:
-        pred_e = pred_e.sum(dim=-3)        # [B,T]
-        gt_e   = gt_e.sum(dim=-3)
-
-    # Schroeder integral (reverse cumsum over time)
-    pred_tr = torch.flip(torch.cumsum(torch.flip(pred_e, dims=[-1]), dim=-1), dims=[-1])
-    gt_tr   = torch.flip(torch.cumsum(torch.flip(gt_e,   dims=[-1]), dim=-1), dims=[-1])
-
-    # log10 + L1
-    eps = 1e-12
-    return F.l1_loss(torch.log10(pred_tr + eps), torch.log10(gt_tr + eps))
 
 # -------------------------------------------------------------------
 
@@ -248,18 +216,71 @@ class Trainer:
         return pred
 
     # ---- compact EDC loss (computed on full STFT batches only) ----
-    def _edc_loss(self, pred_log: torch.Tensor, gt_log: torch.Tensor):
-        # ISTFT → wav → EDC inside evaluator helpers
-        # We use evaluator’s internal GriffinLim (32 iters). Here we re-use self.istft (fast).
-        with torch.no_grad():
-            gt_mag = torch.exp(gt_log) - 1e-3
-            wav_gt = self.istft(gt_mag.squeeze(1))  # [B, T_wav], mono or each-ch collapsed
-        pred_mag = torch.exp(pred_log) - 1e-3
-        wav_pr = self.istft(pred_mag.squeeze(1))
-        # EDC curve L2 on dB-normalized Schroeder (batch mean)
-        # Use evaluator’s public API by “evaluating” and just reading the 'edc' scalar.
-        met = self.evaluator.evaluate(pred_log, gt_log)
-        return torch.as_tensor(met["edc"], device=pred_log.device, dtype=pred_log.dtype)
+    def _edc_loss(self, pred_log: torch.Tensor, gt_log: torch.Tensor,
+                valid_mask: Optional[torch.Tensor] = None,
+                p: int = 1, eps: float = 1e-12) -> torch.Tensor:
+        """
+        Differentiable EDC loss on the 60-frame STFT grid.
+        pred_log, gt_log: [B, C, F, 60] or [B, 1, F, 60] log-magnitude.
+        Steps:
+        - mag = exp(log) - 1e-3, clamp >= 0
+        - per-frame energy: sum over F (and C if present)
+        - Schroeder: reverse cumsum over time
+        - dB, per-curve shape normalization (0 dB at t=0, unit std over valid frames)
+        - L1 (p=1) or root-L2 (p=2) over time
+        """
+        assert pred_log.dim() == 4 and gt_log.dim() == 4 and pred_log.shape[-1] == 60, \
+            "EDC loss expects full 60-frame STFT sequences."
+
+        # magnitudes
+        pred_mag = (pred_log.exp() - 1e-3).clamp_min(0.0)
+        gt_mag   = (gt_log.exp()   - 1e-3).clamp_min(0.0)
+
+        # energy over frequency (and channel)
+        E_pred = (pred_mag ** 2).sum(dim=-2)  # [B,C,60]
+        E_gt   = (gt_mag   ** 2).sum(dim=-2)
+        if E_pred.dim() == 3:
+            E_pred = E_pred.sum(dim=-3)      # [B,60]
+            E_gt   = E_gt.sum(dim=-3)        # [B,60]
+
+        # Schroeder (reverse cumsum)
+        S_pred = torch.flip(torch.cumsum(torch.flip(E_pred, dims=[-1]), dim=-1), dims=[-1])
+        S_gt   = torch.flip(torch.cumsum(torch.flip(E_gt,   dims=[-1]), dim=-1), dims=[-1])
+
+        # dB
+        s_pred = 10.0 * torch.log10(S_pred + eps)
+        s_gt   = 10.0 * torch.log10(S_gt   + eps)
+
+        # shape normalization per-curve: zero at t0, unit std on valid frames
+        B, T = s_pred.shape
+        if valid_mask is None:
+            valid_mask = torch.ones(B, T, dtype=torch.bool, device=s_pred.device)
+
+        s_pred = s_pred - s_pred[:, :1]
+        s_gt   = s_gt   - s_gt[:, :1]
+
+        def _std_over_valid(x, m):
+            cnt = m.sum(dim=-1, keepdim=True).clamp_min(1)
+            mu  = (x * m).sum(dim=-1, keepdim=True) / cnt
+            var = ((x - mu) ** 2 * m).sum(dim=-1, keepdim=True) / cnt
+            return torch.sqrt(var + eps)
+
+        std_p = _std_over_valid(s_pred, valid_mask)
+        std_g = _std_over_valid(s_gt,   valid_mask)
+        s_pred = s_pred / std_p
+        s_gt   = s_gt   / std_g
+
+        # distance
+        diff = (s_pred - s_gt) * valid_mask
+        if p == 1:
+            per_t = diff.abs()
+            per_s = per_t.sum(dim=-1) / valid_mask.sum(dim=-1).clamp_min(1)
+            return per_s.mean()
+        else:  # p == 2
+            per_t = diff.pow(2)
+            per_s = per_t.sum(dim=-1) / valid_mask.sum(dim=-1).clamp_min(1)
+            return torch.sqrt(per_s + eps).mean()
+
 
     def _loss(self, pred_log, gt_log, dataset_mode: str):
         pred_log = pred_log.float(); gt_log = gt_log.float()
@@ -359,27 +380,23 @@ class Trainer:
                 # --- normal spectral parts ---
                 total, parts, edc_val = self._loss(pred, gt, dataset_mode)
 
-                # ★ If we asked for full-EDC but are in slice mode with EDCFullBatchSampler, pack slices → full
-                if (self.lambda_edc > 0.0) and self.use_edc_full and (dataset_mode != "full"):
+                # inside train() loop, after total, parts, edc_val = self._loss(...)
+                if self.lambda_edc > 0.0:
+                    # If we’re in slice mode, pack slices into full sequences (T=60).
                     T = getattr(train_loader.dataset, "max_frames", None)  # e.g., 60
                     if T is not None and (gt.shape[0] % T == 0):
                         B = gt.shape[0] // T
-                        # pred: [B*T, C, F, 1] → [B, C, F, T]
-                        pred_full = pred.view(B, T, *pred.shape[1:]).transpose(1, -1).squeeze(-1)  # [B,C,F,T]
-                        # gt:   [B*T, 1, F, 1] → [B, 1, F, T]
-                        gt_full   = gt.view(B, T, *gt.shape[1:]).transpose(1, -1).squeeze(-1)      # [B,1,F,T]
-                        # ★ add EDC term on full sequences
-                        edc_term = self._edc_loss(pred_full, gt_full)
+                        # pred: [B*T, C, F, 1] -> [B, C, F, T]
+                        pred_full = pred.view(B, T, *pred.shape[1:]).transpose(1, -1).squeeze(-1)
+                        gt_full   = gt.view(B, T, *gt.shape[1:]).transpose(1, -1).squeeze(-1)
+                        # differentiable EDC on STFT
+                        edc_term = self._edc_loss(pred_full, gt_full, valid_mask=None, p=1)
                         total = total + self.lambda_edc * edc_term
                         edc_val = edc_term.detach()
-                        # ★ WandB: log EDC term and total loss (optional)
-                        if wandb_run is not None:
-                            wandb_run.log({
-                                "train/edc_term": edc_term.item(),
-                            })
-                    elif self.use_edc_full and not self._warned_slice_edc:
-                        print("[warn] edc_full=True but this slice batch is not divisible by T — skipping EDC.")
-                        self._warned_slice_edc = True
+                    else:
+                        if not self._warned_slice_edc:
+                            print("[warn] cannot pack slices into full T=60 — skipping EDC term this step.")
+                            self._warned_slice_edc = True
 
                 self.optimizer.zero_grad(set_to_none=True)
                 self.scaler.scale(total).backward()

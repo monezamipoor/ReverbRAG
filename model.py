@@ -7,7 +7,7 @@
 #     * NeRAF mode uses global 1024-D features (as before).
 #     * AV-NeRF mode prefers per-pose features from dataset; still accepts 1024-D fallback.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 from generator import ReverbRAGGenerator
@@ -27,10 +27,12 @@ class ModelConfig:
     database: Literal["raf", "soundspaces"] = "raf"
     scene_root: str = "../NeRAF/data/RAF"
     scene_name: str = "FurnishedRoom"
-    sample_rate: int = 48000  # 48k -> 513 bins; 16k -> 257 bins
+    sample_rate: int = 48000
     W_field: int = 1024
     scene_aabb: torch.Tensor = torch.tensor([[0.0, 0.0, 0.0],
                                              [1.0, 1.0, 1.0]], dtype=torch.float32)
+    reverbrag: dict = field(default_factory=dict)
+# -----------------------
 
 
 def fs_to_stft_params(fs: int):
@@ -42,21 +44,15 @@ def fs_to_stft_params(fs: int):
     return dict(N_freq=513, hop_len=256, win_len=512)
 
 
-# --------------------------------
-# NeRAF-style Encoder (unchanged)
-# --------------------------------
 class NeRAFEncoder(nn.Module):
     """
-    Keep the NeRAF encoder stack intact:
-      - NeRFEncoding for time (1D)
-      - NeRFEncoding for 3D positions (mic, src)
-      - SHEncoding(levels=4) for orientation
-    The trunk maps concatenated encodings + visual(1024) → W token per time step.
+    NeRAF encoder; optionally concatenates an aux vector (size=W) before the trunk
+    when fusion == 'input'.
     """
 
-    def __init__(self, W: int, visual_dim: int = 1024):
+    def __init__(self, W: int, visual_dim: int = 1024, use_aux: bool = False):
         super().__init__()
-        # Exact encoding hyperparams
+        self.use_aux = use_aux
         self.time_encoding = NeRFEncoding(
             in_dim=1, num_frequencies=10, min_freq_exp=0.0, max_freq_exp=8.0, include_input=True
         )
@@ -65,11 +61,10 @@ class NeRAFEncoder(nn.Module):
         )
         self.rot_encoding = SHEncoding(levels=4, implementation="tcnn")
 
-        # Trunk dimensions
         d_time = self.time_encoding.get_out_dim()
         d_pos = self.position_encoding.get_out_dim()
         d_rot = self.rot_encoding.get_out_dim()
-        in_size = d_time + (2 * d_pos) + d_rot + visual_dim
+        in_size = d_time + (2 * d_pos) + d_rot + visual_dim + (W if self.use_aux else 0)
 
         self.trunk = nn.Sequential(
             nn.Linear(in_size, 5096), nn.LeakyReLU(0.1, inplace=True),
@@ -82,79 +77,72 @@ class NeRAFEncoder(nn.Module):
         self,
         mic_xyz: torch.Tensor,       # [B,3]
         src_xyz: torch.Tensor,       # [B,3]
-        head_dir: torch.Tensor,      # [B,3]  (SH)
-        t_idx: torch.Tensor,         # [B,T,1] raw indices 0..T-1 or [B,1,1] for slice
+        head_dir: torch.Tensor,      # [B,3]
+        t_idx: torch.Tensor,         # [B,T,1] or [B,1,1]
         visual_feat: torch.Tensor,   # [B,1024]
         aabb: torch.Tensor,          # [2,3]
+        aux: Optional[torch.Tensor] = None,  # [B,W] when use_aux=True
     ) -> torch.Tensor:
-        """
-        Returns:
-            w: [B, T, W]
-        """
         B, T = t_idx.shape[0], t_idx.shape[1]
 
         # normalize time inside model
         if T > 1:
             t_norm = (t_idx.float() / float(T - 1)).clamp(0.0, 1.0)
         else:
-            t_norm = (t_idx.float() / 59.0).clamp(0.0, 1.0)  # slice mode
+            t_norm = (t_idx.float() / 59.0).clamp(0.0, 1.0)
 
         mic_n = SceneBox.get_normalized_positions(mic_xyz, aabb)
         src_n = SceneBox.get_normalized_positions(src_xyz, aabb)
 
-        mic_e = self.position_encoding(mic_n)   # [B, d_pos]
-        src_e = self.position_encoding(src_n)   # [B, d_pos]
-        rot_e = self.rot_encoding(head_dir)     # [B, d_rot]
-        vis_e = visual_feat                     # [B, 1024]
+        mic_e = self.position_encoding(mic_n)
+        src_e = self.position_encoding(src_n)
+        rot_e = self.rot_encoding(head_dir)
+        vis_e = visual_feat
 
-        static = torch.cat([mic_e, src_e, rot_e, vis_e], dim=-1)  # [B, S]
+        static = torch.cat([mic_e, src_e, rot_e, vis_e], dim=-1)  # [B,S]
+        if self.use_aux:
+            if aux is None:
+                aux = torch.zeros(B, vis_e.shape[-1], device=static.device, dtype=static.dtype)  # safe default
+            static = torch.cat([static, aux], dim=-1)
 
-        # Time-dependent path (per-frame)
-        t_e = self.time_encoding(t_norm.reshape(B * T, 1))  # [B*T, d_time]
-        t_e = t_e.view(B, T, -1)
-
-        static_exp = static.unsqueeze(1).expand(B, T, static.shape[-1])  # [B,T,S]
+        t_e = self.time_encoding(t_norm.reshape(B * T, 1)).view(B, T, -1)
+        static_exp = static.unsqueeze(1).expand(B, T, static.shape[-1])
         enc = torch.cat([t_e, static_exp], dim=-1)                       # [B,T,in_size]
 
-        enc_flat = enc.reshape(B * T, -1)
-        w_flat = self.trunk(enc_flat)                # [B*T, W]
-        w = w_flat.view(B, T, -1)                    # [B,T,W]
+        w = self.trunk(enc.reshape(B * T, -1)).view(B, T, -1)            # [B,T,W]
         return w
 
 
 # --------------------------------------------------
-# AV-NeRF-style Encoder for RIR (no orientation here)
+# AV-NeRF-style Encoder (+ optional aux)
 # --------------------------------------------------
 class AVNeRFEncoder(nn.Module):
     """
-    AV-NeRF variant: orientation is NOT consumed in the encoder (to match AV-NeRF),
-    but we still keep the same time & position encodings, and we allow per-pose visual features.
+    AV-NeRF variant; optionally concatenates an aux vector (size=W) before the trunk
+    when fusion == 'input'. (Orientation goes to decoder.)
     """
 
-    def __init__(self, W: int, visual_dim_in: int = 1024, visual_dim_out: int = 128, dropout_p: float = 0.0):
+    def __init__(self, W: int, visual_dim_in: int = 1024, visual_dim_out: int = 128,
+                 dropout_p: float = 0.0, use_aux: bool = False):
         super().__init__()
-        # same time/position encodings as NeRAF
+        self.use_aux = use_aux
         self.time_encoding = NeRFEncoding(
             in_dim=1, num_frequencies=10, min_freq_exp=0.0, max_freq_exp=8.0, include_input=True
         )
         self.position_encoding = NeRFEncoding(
             in_dim=3, num_frequencies=10, min_freq_exp=0.0, max_freq_exp=8.0, include_input=True
         )
-        # NOTE: no SH orientation here
 
-        # small AV MLP for per-pose visual features (if present) + mydropout
-        
-        self.av_mlp = nn.Sequential(nn.Linear(visual_dim_in, 512),
-                                    nn.ReLU(inplace=True),
-                                    nn.Linear(512, visual_dim_out),
-                                    nn.ReLU(inplace=True),
-                                    nn.Linear(visual_dim_out, visual_dim_out))
-        
+        self.av_mlp = nn.Sequential(
+            nn.Linear(visual_dim_in, 512), nn.ReLU(inplace=True),
+            nn.Linear(512, visual_dim_out), nn.ReLU(inplace=True),
+            nn.Linear(visual_dim_out, visual_dim_out),
+        )
         self.dropout_p = dropout_p
 
         d_time = self.time_encoding.get_out_dim()
-        d_pos = self.position_encoding.get_out_dim()
-        in_size = d_time + (2 * d_pos) + visual_dim_out  # mic+src+time+visual
+        d_pos  = self.position_encoding.get_out_dim()
+        in_size = d_time + (2 * d_pos) + visual_dim_out + (W if self.use_aux else 0)
 
         self.trunk = nn.Sequential(
             nn.Linear(in_size, 5096), nn.LeakyReLU(0.1, inplace=True),
@@ -168,28 +156,21 @@ class AVNeRFEncoder(nn.Module):
     def mydropout(tensor, p=0.5, training=True):
         if not training or p == 0:
             return tensor
-        else:
-            batch_size = tensor.shape[0]
-            random_tensor = torch.rand(batch_size, device=tensor.device)
-            new_tensor = [torch.zeros_like(tensor[i]) if random_tensor[i] <= p else tensor[i] for i in range(batch_size)]
-            new_tensor = torch.stack(new_tensor, dim=0) # [B, ...]
-            return new_tensor
+        b = tensor.shape[0]
+        mask = (torch.rand(b, device=tensor.device) > p).float().view(b, *([1] * (tensor.ndim - 1)))
+        return tensor * mask
 
     def forward(
         self,
         mic_xyz: torch.Tensor,       # [B,3]
         src_xyz: torch.Tensor,       # [B,3]
         t_idx: torch.Tensor,         # [B,T,1]
-        visual_feat: torch.Tensor,   # [B,Dv] (per-pose preferred; fallback 1024)
+        visual_feat: torch.Tensor,   # [B,Dv]
         aabb: torch.Tensor,          # [2,3]
+        aux: Optional[torch.Tensor] = None,  # [B,W] when use_aux=True
     ) -> torch.Tensor:
-        """
-        Returns:
-            w: [B, T, W]
-        """
         B, T = t_idx.shape[0], t_idx.shape[1]
 
-        # normalize time inside model
         if T > 1:
             t_norm = (t_idx.float() / float(T - 1)).clamp(0.0, 1.0)
         else:
@@ -198,26 +179,25 @@ class AVNeRFEncoder(nn.Module):
         mic_n = SceneBox.get_normalized_positions(mic_xyz, aabb)
         src_n = SceneBox.get_normalized_positions(src_xyz, aabb)
 
-        mic_e = self.position_encoding(mic_n)   # [B, d_pos]
-        src_e = self.position_encoding(src_n)   # [B, d_pos]
+        mic_e = self.position_encoding(mic_n)
+        src_e = self.position_encoding(src_n)
 
-        # per-pose visual pathway
         if visual_feat.ndim == 1:
             visual_feat = visual_feat.unsqueeze(0)
-        v_feats = self.av_mlp(visual_feat)              # [B, visual_dim_out]
-        v_feats = self.mydropout(v_feats, p=self.dropout_p, training=self.training)
+        v = self.av_mlp(visual_feat)
+        v = self.mydropout(v, p=self.dropout_p, training=self.training)
 
-        static = torch.cat([mic_e, src_e, v_feats], dim=-1)  # [B, S]
+        static = torch.cat([mic_e, src_e, v], dim=-1)
+        if self.use_aux:
+            if aux is None:
+                aux = torch.zeros(B, v.shape[-1], device=static.device, dtype=static.dtype)
+            static = torch.cat([static, aux], dim=-1)
 
-        t_e = self.time_encoding(t_norm.reshape(B * T, 1))  # [B*T, d_time]
-        t_e = t_e.view(B, T, -1)
+        t_e = self.time_encoding(t_norm.reshape(B * T, 1)).view(B, T, -1)
+        static_exp = static.unsqueeze(1).expand(B, T, static.shape[-1])
+        enc = torch.cat([t_e, static_exp], dim=-1)
 
-        static_exp = static.unsqueeze(1).expand(B, T, static.shape[-1])  # [B,T,S]
-        enc = torch.cat([t_e, static_exp], dim=-1)                       # [B,T,in_size]
-
-        enc_flat = enc.reshape(B * T, -1)
-        w_flat = self.trunk(enc_flat)                # [B*T, W]
-        w = w_flat.view(B, T, -1)                    # [B,T,W]
+        w = self.trunk(enc.reshape(B * T, -1)).view(B, T, -1)
         return w
 
 
@@ -296,16 +276,11 @@ class NeRAFDecoder(nn.Module):
 # Unified ReverbRAG NVAS Model
 # ----------------------------
 class UnifiedReverbRAGModel(nn.Module):
-    """
-    Inputs:
-      mic_xyz[B,3], src_xyz[B,3], head_dir[B,3], t_idx[B,T,1], visual_feat[B,Dv]
-    Output: stft_pred[B, C, F, T]
-    """
-
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
-        self._logger = None  # for wandb logging if needed
+        self._logger = None
+
         aabb = getattr(cfg, "scene_aabb", None)
         aabb = aabb.clone().detach().float() if aabb is not None else torch.tensor(
             [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], dtype=torch.float32
@@ -316,34 +291,30 @@ class UnifiedReverbRAGModel(nn.Module):
         self.N_freq = stft["N_freq"]
         self.n_channels = 1 if cfg.database == "raf" else 2
 
+        # ---- RAG ----
+        rag_cfg = getattr(cfg, "reverbrag", {})
+        self.fusion = str(rag_cfg.get("fusion", "film")).lower()
+
         # Encoders
         if cfg.baseline == "neraf":
             self.encoder_kind = "neraf"
-            self.encoder = NeRAFEncoder(W=cfg.W_field, visual_dim=1024)
-            dir_cond_dim = 0  # no decoder conditioning; NeRAF uses orientation in encoder
+            self.encoder = NeRAFEncoder(W=cfg.W_field, visual_dim=1024, use_aux=(self.fusion == "input"))
+            dir_cond_dim = 0
         elif cfg.baseline == "avnerf":
             self.encoder_kind = "avnerf"
-            # allow arbitrary per-pose visual dims; we'll accept whatever comes and linearize
-            self.encoder = AVNeRFEncoder(W=cfg.W_field, visual_dim_in=1024, visual_dim_out=1024, dropout_p=0.1)
-            # decoder will accept SH(3D) as FiLM
+            self.encoder = AVNeRFEncoder(W=cfg.W_field, visual_dim_in=1024, visual_dim_out=1024,
+                                         dropout_p=0.1, use_aux=(self.fusion == "input"))
             self.rot_encoding = SHEncoding(levels=4, implementation="tcnn")
             dir_cond_dim = self.rot_encoding.get_out_dim()
         else:
             raise ValueError(f"Unknown baseline {cfg.baseline}")
 
-        # Decoder (same heads in both modes; AV-NeRF may use FiLM on W)
         self.decoder = NeRAFDecoder(W=cfg.W_field, n_freq=self.N_freq,
                                     n_channels=self.n_channels, dir_cond_dim=dir_cond_dim)
-        
-        # ---- ReverbRAG (lightweight placeholder for now) ----
-        self.use_rag = True
-        rag_cfg = getattr(cfg, "reverbrag", {}) if hasattr(cfg, "reverbrag") else {}
-        self.rag_gen = ReverbRAGGenerator(
-            cfg=rag_cfg,
-            W=cfg.W_field,   # <— pass token width so FiLM/Gate params are created BEFORE optimizer
-        )
 
-    # Let Trainer inject a logger (e.g., wandb)
+        self.use_rag = True
+        self.rag_gen = ReverbRAGGenerator(cfg=rag_cfg if rag_cfg else {"reverbrag": {}}, W=cfg.W_field)
+
     def set_logger(self, logger):
         self._logger = logger
         if hasattr(self.rag_gen, "set_logger"):
@@ -356,20 +327,29 @@ class UnifiedReverbRAGModel(nn.Module):
         head_dir: torch.Tensor,
         t_idx: torch.Tensor,
         visual_feat: torch.Tensor,
-        refs_logmag: torch.Tensor = None,     # [B,K,1,F,60] log-mag
-        refs_mask: torch.Tensor = None,       # [B,K] (bool)
-        refs_feats: torch.Tensor = None,          # [B,K,BANDS,4] decay features (not used yet)
+        refs_logmag: torch.Tensor = None,   # [B,K,1,F,60]
+        refs_mask: torch.Tensor = None,     # [B,K]
+        refs_feats: torch.Tensor = None,    # [B,K,32,4]
     ) -> torch.Tensor:
+
+        # --- input mode: build h BEFORE encoder and inject as aux ---
+        aux = None
+        if self.use_rag and (self.fusion == "input"):
+            h = self.rag_gen.build_h(refs_feats, refs_mask)           # [B,h_dim] or None
+            aux = self.rag_gen.project_aux(h)                         # [B,W] or None
+
         if self.encoder_kind == "neraf":
-            w = self.encoder(mic_xyz, src_xyz, head_dir, t_idx, visual_feat, self.aabb)  # [B,T,W]
-            # (for now) just let generator optionally pre-process w / refs and return a (maybe) modified w
-            w = self.rag_gen.pre_fuse(w, refs_logmag, refs_mask, refs_feats) if self.use_rag else w
+            w = self.encoder(mic_xyz, src_xyz, head_dir, t_idx, visual_feat, self.aabb, aux=aux)  # [B,T,W]
+            if self.use_rag and self.fusion in ("film", "concat"):
+                w = self.rag_gen.pre_fuse(w, refs_logmag, refs_mask, refs_feats)
             return self.decoder(w)
 
-        # AV-NeRF path
-        w = self.encoder(mic_xyz, src_xyz, t_idx, visual_feat, self.aabb)
+        # AV-NeRF path: orientation to decoder
+        w = self.encoder(mic_xyz, src_xyz, t_idx, visual_feat, self.aabb, aux=aux)
         B, T = t_idx.shape[0], t_idx.shape[1]
         rot_e = self.rot_encoding(head_dir).unsqueeze(1).expand(B, T, -1).contiguous()
-        # same pre-fuse hook
-        w = self.rag_gen.pre_fuse(w, refs_logmag, refs_mask, refs_feats) if self.use_rag else w
+
+        if self.use_rag and self.fusion in ("film", "concat"):
+            w = self.rag_gen.pre_fuse(w, refs_logmag, refs_mask, refs_feats)
+
         return self.decoder(w, dir_cond=rot_e)

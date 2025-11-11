@@ -245,7 +245,9 @@ def main():
         baseline=baseline, database=database,
         scene_root=root, scene_name=scene,
         sample_rate=fs, W_field=1024, scene_aabb=train_ds.scene_box.aabb,
+        reverbrag=cfg.get("reverbrag", {}),
     )
+
     model = UnifiedReverbRAGModel(mcfg).to(device)
 
     # --------- Trainer ----------

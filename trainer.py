@@ -2,7 +2,7 @@
 import math
 from copy import deepcopy
 import os
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 
 from decay_features import build_ref_decay_features_bank
 import torch
@@ -365,6 +365,36 @@ class Trainer:
                 g["lr"] = float(lr_override)
         print(f"[resume] loaded {path} (load_optimizer={load_optimizer}, lr_override={lr_override})")
 
+
+    # ---- helpers ----
+    def _grad_stats_of(self, module) -> Tuple[float, float, int]:
+        """Return (l2_norm, rms, n_params_with_grads). Call AFTER unscale_()."""
+        total_sq = torch.zeros((), device="cuda", dtype=torch.float32)
+        count = 0
+        for p in module.parameters():
+            if p.grad is None:
+                continue
+            g = p.grad.detach().float()
+            total_sq += (g * g).sum()
+            count += g.numel()
+        l2  = float(torch.sqrt(total_sq + 1e-12).item())
+        rms = float(torch.sqrt(total_sq / max(count, 1) + 1e-12).item())
+        return l2, rms, count
+
+    def _grad_stats_total(self) -> Tuple[float, float, int]:
+        total_sq = torch.zeros((), device="cuda", dtype=torch.float32)
+        count = 0
+        for p in self.model.parameters():
+            if p.grad is None:
+                continue
+            g = p.grad.detach().float()
+            total_sq += (g * g).sum()
+            count += g.numel()
+        l2  = float(torch.sqrt(total_sq + 1e-12).item())
+        rms = float(torch.sqrt(total_sq / max(count, 1) + 1e-12).item())
+        return l2, rms, count
+
+
     # ------------------------- API -------------------------
     def train(
         self, train_loader, val_loader, epochs: int, wandb_run=None,
@@ -434,20 +464,57 @@ class Trainer:
 
                 self.optimizer.zero_grad(set_to_none=True)
                 self.scaler.scale(total).backward()
-                
-                
+                self.scaler.unscale_(self.optimizer)
+
                 # ---- NEW: gradient norms before step (every self.log_every) ----
-                if (wandb_run is not None) and (step % self.log_every == 0):
-                    enc_gn = self._grad_norm_of("encoder")
-                    dec_gn = self._grad_norm_of("decoder")
-                    gen_gn = self._grad_norm_of("rag_gen")
-                    tot_gn = self._grad_norm_total()
-                    gn_log = {
-                        "grads/encoder_gn": enc_gn, "grads/decoder_gn": dec_gn,
-                        "grads/generator_gn": gen_gn, "grads/total_gn": tot_gn,
-                    }
-                    wandb_run.log(gn_log)
-                
+                if wandb_run is not None and (step % self.log_every == 0):
+                    # ---- single-pass module attribution via id(p) ----
+                    enc_ids = {id(p) for p in self.model.encoder.parameters()}
+                    dec_ids = {id(p) for p in self.model.decoder.parameters()}
+                    gen_ids = {id(p) for p in self.model.rag_gen.parameters()} if hasattr(self.model, "rag_gen") else set()
+
+                    tot_sq = torch.zeros((), device="cuda", dtype=torch.float32); tot_cnt = 0
+                    enc_sq = torch.zeros((), device="cuda", dtype=torch.float32); enc_cnt = 0
+                    dec_sq = torch.zeros((), device="cuda", dtype=torch.float32); dec_cnt = 0
+                    gen_sq = torch.zeros((), device="cuda", dtype=torch.float32); gen_cnt = 0
+
+                    for p in self.model.parameters():
+                        if p.grad is None: 
+                            continue
+                        g = p.grad.detach().float()
+                        s = (g * g).sum()
+                        n = g.numel()
+                        tot_sq += s; tot_cnt += n
+                        pid = id(p)
+                        if pid in enc_ids: enc_sq += s; enc_cnt += n
+                        elif pid in dec_ids: dec_sq += s; dec_cnt += n
+                        elif pid in gen_ids: gen_sq += s; gen_cnt += n
+
+                    eps = 1e-12
+                    tot_l2  = torch.sqrt(tot_sq + eps)
+                    enc_l2  = torch.sqrt(enc_sq + eps)
+                    dec_l2  = torch.sqrt(dec_sq + eps)
+                    gen_l2  = torch.sqrt(gen_sq + eps)
+                    tot_rms = torch.sqrt(tot_sq / max(tot_cnt, 1) + eps)
+                    enc_rms = torch.sqrt(enc_sq / max(enc_cnt, 1) + eps)
+                    dec_rms = torch.sqrt(dec_sq / max(dec_cnt, 1) + eps)
+                    gen_rms = torch.sqrt(gen_sq / max(gen_cnt, 1) + eps)
+
+                    enc_share = (enc_l2 / (tot_l2 + eps)).item()
+                    dec_share = (dec_l2 / (tot_l2 + eps)).item()
+                    gen_share = (gen_l2 / (tot_l2 + eps)).item()
+
+                    wandb_run.log({
+                        "grads/encoder_rms": float(enc_rms.item()),
+                        "grads/decoder_rms": float(dec_rms.item()),
+                        "grads/generator_rms": float(gen_rms.item()),
+                        "grads/total_rms":    float(tot_rms.item()),
+                        "grads/encoder_share": enc_share,
+                        "grads/decoder_share": dec_share,
+                        "grads/generator_share": gen_share,
+                        "grads/log10_total_rms": float(torch.log10(tot_rms + eps).item()),
+                    })
+
                 
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
@@ -499,4 +566,3 @@ class Trainer:
             n += 1
         self.model.train()
         return {k: (v / max(1, n)) for k, v in e_sum.items()}
-    

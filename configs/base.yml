@@ -17,11 +17,15 @@ run:
     load_optimizer: false     # if true, restore optimizer state (and LR scheduler progress)
     lr_override: null         # e.g., 1e-4; if set, forces this LR after resume
 
+renders:
+  save_renders: ./renders   # set to null to disable
+  model: ./checkpoints/20251110-2341_base/epoch_60.pt  # path to trained model; set to null to use latest checkpoint from run
+
   # logging
   log_every: 50               # iterations
 
 sampler:
-  batch_size: 4096         # Normal batch size (Not EDC mode)
+  batch_size: 2048         # Normal batch size (Not EDC mode)
   rirs_per_batch: 40       # only for EDC mode
   shuffle: true
   num_workers: 8
@@ -38,9 +42,10 @@ databases:
     root: /data/SoundSpaces
 
 reverbrag:
+  fusion: concat         # {film | concat | input}
   k: 1                      # we only use top-1 here
   num_bands: 32             # features are [32 x 4]
-  gating: false              # enable scalar gate
+  gating: true              # enable scalar gate
 
   # reference MLP over 32x4 features
   mlp_hidden: [128, 256, 256]

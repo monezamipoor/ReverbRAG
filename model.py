@@ -266,7 +266,7 @@ class NeRAFDecoder(nn.Module):
         outs = []
         for head in self.heads:
             f_flat = head(dec_in)                 # [B*T, F]
-            f_flat = torch.tanh(f_flat) * 10
+            f_flat = torch.clamp(torch.tanh(f_flat) * 10, min=-6.0)
             f = f_flat.view(B, T, -1).transpose(1, 2)  # [B, F, T]
             outs.append(f.unsqueeze(1))           # [B,1,F,T]
         return torch.cat(outs, dim=1)             # [B, C, F, T]

@@ -4,10 +4,10 @@ run:
   model: avnerf                # {neraf | avnerf}
   database: raf               # {raf | soundspaces}
   scene: FurnishedRoom        # e.g., EmptyRoom, FurnishedRoom
-  reverbrag: true           # {true | false}
+  reverbrag: false           # {true | false}
   sample_rate: 48000
   epochs: 100
-  edc_loss: 0.2               # weight for EDC loss; 0.0 to disable EDC training
+  edc_loss: 0.0               # weight for EDC loss; 0.0 to disable EDC training
 
   # NEW – checkpointing & resume
   save_root: ./checkpoints          # root for run folders

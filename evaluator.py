@@ -72,8 +72,8 @@ class UnifiedEvaluator:
 
     @staticmethod
     def _logmag_to_mag(logmag: torch.Tensor) -> torch.Tensor:
-        # NeRAF uses log(mag + 1e-3); invert consistently
-        return torch.exp(logmag) - 1e-3
+        # Invert and CLAMP: negative magnitudes break Griffin–Lim
+        return torch.clamp(torch.exp(logmag) - 1e-3, min=0.0)
 
     @torch.no_grad()
     def _stft_loss_neraf(self, pred_log: torch.Tensor, gt_log: torch.Tensor) -> float:

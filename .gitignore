@@ -27,7 +27,8 @@ camera_path.json
 wandb/
 *.glb
 *.ply
-
+*.csv
+*.json
 # Python cruft
 __pycache__/
 *.py[cod]

@@ -150,14 +150,22 @@ def main():
         # Save each sample
         B = pred_log.shape[0]
         for b in range(B):
+            # determine sample SID instead of numeric index
+            if batch_ids is not None:
+                sid = str(batch_ids[b])
+            elif hasattr(test_ds, "ids") and batch_idx[b] < len(test_ds.ids):
+                sid = test_ds.ids[batch_idx[b]]
+            else:
+                sid = f"{batch_idx[b]:06d}"
+
             rec = {
-                "audio_idx": int(batch_idx[b]),
+                "sid": sid,
                 "pred_stft": pred_log[b, 0].detach().cpu().numpy() if pred_log.shape[1] >= 1 else pred_log[b].mean(0).cpu().numpy(),
                 "pred_wav":  wav_pred[b, 0] if wav_pred.shape[1] >= 1 else wav_pred[b].mean(0),
             }
             out_path = os.path.join(renders_dir, f"{counter:06d}.npy")
             np.save(out_path, rec)
-            manifest.append({"file": f"{counter:06d}.npy", "audio_idx": int(batch_idx[b])})
+            manifest.append({"file": f"{counter:06d}.npy", "sid": sid})
             counter += 1
 
     with open(os.path.join(base_dir, "manifest.json"), "w") as f:

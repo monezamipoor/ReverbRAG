@@ -4,7 +4,6 @@ run:
   model: avnerf                # {neraf | avnerf}
   database: raf               # {raf | soundspaces}
   scene: FurnishedRoom        # e.g., EmptyRoom, FurnishedRoom
-  reverbrag: false           # {true | false}
   sample_rate: 48000
   epochs: 100
   edc_loss: 0.0               # weight for EDC loss; 0.0 to disable EDC training
@@ -42,6 +41,7 @@ databases:
     root: /data/SoundSpaces
 
 reverbrag:
+  enabled: false
   fusion: concat         # {film | concat | input}
   k: 1                      # we only use top-1 here
   num_bands: 32             # features are [32 x 4]

@@ -154,6 +154,7 @@ class Trainer:
         else:
             self.ref_bank = ref_bank     # [R, 1, F, 60] (log-mag)
         self.ref_bank_ids = ref_bank_ids or []
+        self.rag_module = getattr(self.model, "rag_gen", None)
 
     # ------------- util: build time indices for both modes -------------
     @staticmethod
@@ -534,7 +535,7 @@ class Trainer:
                     raise RuntimeError("Stopping due to NaN loss.")
 
                 # ---- NEW: gradient norms before step (every self.log_every) ----
-                if wandb_run is not None and (step % self.log_every == 0):
+                if wandb_run is not None and (step % self.log_every == 0) and self.rag_module is not None:
                     # ---- single-pass module attribution via id(p) ----
                     enc_ids = {id(p) for p in self.model.encoder.parameters()}
                     dec_ids = {id(p) for p in self.model.decoder.parameters()}

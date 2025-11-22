@@ -312,8 +312,11 @@ class UnifiedReverbRAGModel(nn.Module):
         self.decoder = NeRAFDecoder(W=cfg.W_field, n_freq=self.N_freq,
                                     n_channels=self.n_channels, dir_cond_dim=dir_cond_dim)
 
-        self.use_rag = True
-        self.rag_gen = ReverbRAGGenerator(cfg=rag_cfg if rag_cfg else {"reverbrag": {}}, W=cfg.W_field)
+        self.use_rag = rag_cfg.get("enabled",False)
+        if self.use_rag:
+            self.rag_gen = ReverbRAGGenerator(cfg=rag_cfg, W=cfg.W_field)
+        else:
+            self.rag_gen = None
 
     def set_logger(self, logger):
         self._logger = logger

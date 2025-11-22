@@ -465,6 +465,73 @@ class Trainer:
                 self.optimizer.zero_grad(set_to_none=True)
                 self.scaler.scale(total).backward()
                 self.scaler.unscale_(self.optimizer)
+                
+                # ================================
+                #   HARD DEBUG: LOSS WENT NaN
+                # ================================
+                if not torch.isfinite(total):
+                    print("\n" + "="*80)
+                    print("🔥🔥🔥  TRAIN LOSS BECAME NON-FINITE  🔥🔥🔥")
+                    print("="*80)
+
+                    # ---- basic checks ----
+                    print("pred finite:", torch.isfinite(pred).all().item())
+                    print("gt   finite:", torch.isfinite(gt).all().item())
+
+                    # ---- ranges ----
+                    try:
+                        print("pred range:", pred.min().item(), pred.max().item())
+                    except Exception:
+                        print("pred range: FAILED")
+
+                    try:
+                        print("gt range:", gt.min().item(), gt.max().item())
+                    except Exception:
+                        print("gt range: FAILED")
+
+                    # ---- show the batch IDs ----
+                    if isinstance(batch, dict) and "id" in batch:
+                        print("batch ids:", batch["id"])
+                    else:
+                        print("batch has no 'id' field")
+
+                    # ---- check STFT and WAV inputs ----
+                    if "stft" in batch:
+                        st = batch["stft"]
+                        print("batch stft finite:", torch.isfinite(st).all().item())
+                        try:
+                            print("batch stft range:", st.min().item(), st.max().item())
+                        except Exception:
+                            print("batch stft range: FAILED")
+
+                    if "wav" in batch:
+                        w = batch["wav"]
+                        print("batch wav finite:", torch.isfinite(w).all().item())
+                        try:
+                            print("batch wav range:", w.min().item(), w.max().item())
+                        except Exception:
+                            print("batch wav range: FAILED")
+
+                    # ---- print loss parts ----
+                    print("Loss parts:")
+                    for k, v in (parts or {}).items():
+                        if torch.is_tensor(v):
+                            print(f"  {k}: finite={torch.isfinite(v).all().item()}  value={v.item()}")
+                        else:
+                            print(f"  {k}: {v}")
+
+                    # ---- check gradients before backward ----
+                    print("\nChecking model activations:")
+                    for name, p in self.model.named_parameters():
+                        if p.requires_grad and torch.isfinite(p.data).all() is False:
+                            print(f"PARAM DATA NOT FINITE → {name}")
+                        if p.grad is not None and torch.isfinite(p.grad).all() is False:
+                            print(f"PARAM GRAD NOT FINITE → {name}")
+                            break
+
+                    print("\n!!! ABORTING TRAINING (NaN detected) !!!")
+                    print("="*80)
+                    raise RuntimeError("Stopping due to NaN loss.")
 
                 # ---- NEW: gradient norms before step (every self.log_every) ----
                 if wandb_run is not None and (step % self.log_every == 0):

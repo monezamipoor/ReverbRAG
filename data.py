@@ -101,30 +101,30 @@ class RAFDataset(Dataset):
         self.stft, self.F_bins, self.hop, self.win = _stft_transform(self.sample_rate, center=self.stft_center)
         self.max_frames = 60  # fixed
         
-        # # --- Sharded memmaps (STFT + EDC)
-        # self.mm_index_path = os.path.join(self.feats_dir, "index.json")
-        # self._st_shards = []
-        # self._edc_shards = []
-        # self._sid_ptr = None  # {sid: (shard_id, row)}
+        # --- Sharded memmaps (STFT + EDC)
+        self.mm_index_path = os.path.join(self.feats_dir, "index.json")
+        self._st_shards = []
+        self._edc_shards = []
+        self._sid_ptr = None  # {sid: (shard_id, row)}
 
-        # if os.path.exists(self.mm_index_path):
-        #     with open(self.mm_index_path, "r") as f:
-        #         idx = json.load(f)
-        #     # open shard files once (read-only)
-        #     for sh in idx["shards"]:
-        #         # STFT shards: (count, F, T) in float16
-        #         self._st_shards.append(np.memmap(
-        #             sh["stft"], dtype=np.float16, mode="r", shape=(sh["count"], self.F_bins, self.max_frames)
-        #         ))
-        #         # EDC shards: optional; (count, T) in float32
-        #         if "edc" in sh and os.path.exists(sh["edc"]):
-        #             self._edc_shards.append(np.memmap(
-        #                 sh["edc"], dtype=np.float32, mode="r", shape=(sh["count"], self.max_frames)
-        #             ))
-        #         else:
-        #             self._edc_shards.append(None)
-        #     # sid → (shard_id, row)
-        #     self._sid_ptr = {k: tuple(v) for k, v in idx["sid_to_ptr"].items()}
+        if os.path.exists(self.mm_index_path):
+            with open(self.mm_index_path, "r") as f:
+                idx = json.load(f)
+            # open shard files once (read-only)
+            for sh in idx["shards"]:
+                # STFT shards: (count, F, T) in float16
+                self._st_shards.append(np.memmap(
+                    sh["stft"], dtype=np.float16, mode="r", shape=(sh["count"], self.F_bins, self.max_frames)
+                ))
+                # EDC shards: optional; (count, T) in float32
+                if "edc" in sh and os.path.exists(sh["edc"]):
+                    self._edc_shards.append(np.memmap(
+                        sh["edc"], dtype=np.float32, mode="r", shape=(sh["count"], self.max_frames)
+                    ))
+                else:
+                    self._edc_shards.append(None)
+            # sid → (shard_id, row)
+            self._sid_ptr = {k: tuple(v) for k, v in idx["sid_to_ptr"].items()}
             
         # --- ReverbRAG references
         self.reverbrag_enabled = bool((reverbrag_cfg or {}).get("enabled", False))
@@ -193,57 +193,57 @@ class RAFDataset(Dataset):
         wav = wav[:, : int(self.max_len_time * self.sample_rate)]
         return wav  # [1, T]
 
-    # # -------- Fast-path memmap fetchers (no cache) --------
-    # def _mm_fetch_stft(self, sid: str) -> torch.Tensor:
-    #     """
-    #     Return [1, F, 60] log-magnitude STFT tensor.
-    #     Uses sharded memmap if available; else recomputes.
-    #     """
-    #     ptr = getattr(self, "_sid_ptr", None)
-    #     if ptr is not None:
-    #         k, row = ptr[sid]
-    #         a = self._st_shards[k][row]        # (F, 60) float16
-    #         x = torch.from_numpy(a.astype(np.float32))  # to fp32
-    #         return x.unsqueeze(0)              # [1, F, 60]
-    #     # fallback: recompute once (no caching)
-    #     wav = self._load_wav(sid)
-    #     return self._stft_full(wav)
-
-    # def _mm_fetch_edc(self, sid: str) -> torch.Tensor:
-    #     """
-    #     Return [60] EDC(dB) curve if available, else empty tensor.
-    #     """
-    #     if self._sid_ptr is not None and self._edc_shards:
-    #         k, row = self._sid_ptr[sid]
-    #         edc_mm = self._edc_shards[k]
-    #         if edc_mm is not None:
-    #             return torch.from_numpy(edc_mm[row].astype(np.float32))
-    #     return torch.empty(0)
-        # -------- Online fetchers (no memmaps) --------
+    # -------- Fast-path memmap fetchers (no cache) --------
     def _mm_fetch_stft(self, sid: str) -> torch.Tensor:
         """
-        Return [1, F, max_frames] log-magnitude STFT tensor,
-        computed on the fly from the raw RIR.
+        Return [1, F, 60] log-magnitude STFT tensor.
+        Uses sharded memmap if available; else recomputes.
         """
-        wav = self._load_wav(sid)  # [1, T]
-        stft_logmag = compute_rir_stft_logmag(
-            self.stft, wav, max_frames=self.max_frames
-        )  # [1, F, max_frames]
-        return stft_logmag
+        ptr = getattr(self, "_sid_ptr", None)
+        if ptr is not None:
+            k, row = ptr[sid]
+            a = self._st_shards[k][row]        # (F, 60) float16
+            x = torch.from_numpy(a.astype(np.float32))  # to fp32
+            return x.unsqueeze(0)              # [1, F, 60]
+        # fallback: recompute once (no caching)
+        wav = self._load_wav(sid)
+        return self._stft_full(wav)
 
     def _mm_fetch_edc(self, sid: str) -> torch.Tensor:
         """
-        Return [max_frames] EDC(dB) curve computed on the fly.
-        If you don't need EDC, you can make this return an empty tensor.
+        Return [60] EDC(dB) curve if available, else empty tensor.
         """
-        # If you want to completely disable EDC, just uncomment this:
-        # return torch.empty(0)
+        if self._sid_ptr is not None and self._edc_shards:
+            k, row = self._sid_ptr[sid]
+            edc_mm = self._edc_shards[k]
+            if edc_mm is not None:
+                return torch.from_numpy(edc_mm[row].astype(np.float32))
+        return torch.empty(0)
+    # # -------- Online fetchers (no memmaps) --------
+    # def _mm_fetch_stft(self, sid: str) -> torch.Tensor:
+    #     """
+    #     Return [1, F, max_frames] log-magnitude STFT tensor,
+    #     computed on the fly from the raw RIR.
+    #     """
+    #     wav = self._load_wav(sid)  # [1, T]
+    #     stft_logmag = compute_rir_stft_logmag(
+    #         self.stft, wav, max_frames=self.max_frames
+    #     )  # [1, F, max_frames]
+    #     return stft_logmag
 
-        wav = self._load_wav(sid)  # [1, T]
-        edc = compute_edc_curve_from_wav(
-            wav, T_target=self.max_frames
-        )  # [max_frames]
-        return edc
+    # def _mm_fetch_edc(self, sid: str) -> torch.Tensor:
+    #     """
+    #     Return [max_frames] EDC(dB) curve computed on the fly.
+    #     If you don't need EDC, you can make this return an empty tensor.
+    #     """
+    #     # If you want to completely disable EDC, just uncomment this:
+    #     # return torch.empty(0)
+
+    #     wav = self._load_wav(sid)  # [1, T]
+    #     edc = compute_edc_curve_from_wav(
+    #         wav, T_target=self.max_frames
+    #     )  # [max_frames]
+    #     return edc
 
     # -----------------------------------
 

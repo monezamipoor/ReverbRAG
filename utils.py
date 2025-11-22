@@ -1,5 +1,8 @@
 import json, os
 from typing import Dict, List, Tuple
+import torch
+import torchaudio
+from evaluator import compute_edc_db  # local import to avoid cycles
 
 def _norm_id(x) -> str:
     s = str(x)
@@ -115,3 +118,54 @@ def _take_topk_refs(obj, k: int):
         except Exception:
             return []
     return []
+
+def compute_rir_stft_logmag(
+    stft_module: torchaudio.transforms.Spectrogram,
+    wav: torch.Tensor,
+    max_frames: int,
+    eps: float = 1e-3,
+) -> torch.Tensor:
+    """
+    Compute log-magnitude STFT for a single-channel RIR.
+
+    Args:
+        stft_module: torchaudio Spectrogram (complex, power=None).
+        wav: [1, T] waveform tensor.
+        max_frames: target number of STFT frames (time axis).
+        eps: small constant to avoid log(0).
+
+    Returns:
+        log-magnitude STFT [1, F, max_frames] in float32.
+    """
+    spec = stft_module(wav)  # [1, F, T_full] complex
+    T_cur = spec.shape[-1]
+
+    if T_cur > max_frames:
+        spec = spec[..., :max_frames]
+    elif T_cur < max_frames:
+        # pad with the minimum magnitude value so padding is quiet
+        min_val = float(spec.abs().min())
+        pad_T = max_frames - T_cur
+        spec = torch.nn.functional.pad(spec, (0, pad_T), value=min_val)
+
+    logmag = torch.log(spec.abs() + eps)
+    return logmag.to(dtype=torch.float32)
+
+
+def compute_edc_curve_from_wav(
+    wav: torch.Tensor,
+    T_target: int = 60,
+) -> torch.Tensor:
+    """
+    Compute Schroeder EDC(dB) curve from a single-channel RIR.
+
+    Args:
+        wav: [1, T] waveform.
+        T_target: number of EDC time bins.
+
+    Returns:
+        [T_target] EDC(dB) tensor in float32.
+    """
+    # compute_edc_db expects [T], so squeeze channel dim
+    edc_db = compute_edc_db(wav.squeeze(0), T_target=T_target)
+    return edc_db.to(dtype=torch.float32)

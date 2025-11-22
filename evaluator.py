@@ -66,7 +66,7 @@ class UnifiedEvaluator:
         n_fft, win_length, hop_length = self._fft_params_from_nfreq(nfreq)
         gl = torchaudio.transforms.GriffinLim(
             n_fft=n_fft, win_length=win_length, hop_length=hop_length, power=1.0, n_iter=32
-        ).to(device)
+        ).to(device=device, dtype=torch.float32)
         self._gl_cache[key] = gl
         return gl
 
@@ -99,9 +99,9 @@ class UnifiedEvaluator:
                 ch = []
                 for c in range(x.shape[1]):
                     Xi = torch.stft(
-                        torch.from_numpy(x[b, c]).to(pred_log.device),
+                        torch.from_numpy(x[b, c]).to(pred_log.device, dtype=torch.float32),
                         n_fft=n_fft, hop_length=hop_length, win_length=win_length,
-                        window=torch.hann_window(win_length, device=pred_log.device),
+                        window=torch.hann_window(win_length, device=pred_log.device, dtype=torch.float32),
                         return_complex=True
                     ).abs()  # (F, T)
                     ch.append(Xi.unsqueeze(0))
@@ -126,7 +126,7 @@ class UnifiedEvaluator:
         B, C, nfreq, T = logmag.shape
         device = logmag.device
         gl = self._get_griffin_lim(device, nfreq)
-        mag = self._logmag_to_mag(logmag)  # (B,C,F,T)
+        mag = self._logmag_to_mag(logmag).clamp_min(1e-8).to(dtype=torch.float32)  # (B,C,F,T)
 
         wavs = []
         for b in range(B):
@@ -245,8 +245,6 @@ class UnifiedEvaluator:
             "invalid_t60": int(invalids),
         }
         return res
-
-
     
 def hilbert_envelope(x: torch.Tensor) -> torch.Tensor:
     B,T = x.shape

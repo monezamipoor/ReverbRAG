@@ -86,7 +86,7 @@ class Trainer:
             win_length=stftp["win_len"],
             hop_length=stftp["hop_len"],
             power=1,
-        ).to(device)
+        ).to(device=device, dtype=torch.float32)
         self.evaluator = UnifiedEvaluator(fs=fs, edc_bins=60, edc_dist="l1")
 
         # ---- ReverbRAG reference bank & decay features (CPU, once) ----

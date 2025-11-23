@@ -131,6 +131,7 @@ class Trainer:
         self.lambda_edc = float(run_cfg.get("edc_loss", 0.0))  # e.g., 0.2
         self.use_edc_full = bool(run_cfg.get("edc_full", False))
         self._warned_slice_edc = False
+        self.loss_factor = float(run_cfg.get("loss_factor", 1e-3))
 
         # Optimizer (abstract; two presets)
         if self.baseline == "avnerf":
@@ -277,13 +278,20 @@ class Trainer:
 
     def _loss(self, pred_log, gt_log):
         pred_log = pred_log.float(); gt_log = gt_log.float()
+
+        # ---------- NeRAF STFT loss ----------
         if self.baseline == "neraf":
-            parts = self.loss_fn(pred_log, gt_log)  # dict: audio_sc_loss, audio_mag_loss
+            parts = self.loss_fn(pred_log, gt_log)
             total = 0.1 * parts["audio_sc_loss"] + 1.0 * parts["audio_mag_loss"]
+            total = self.loss_factor * total   # 🔥 APPLY GLOBAL SCALE
             return total, parts, None
-        # AV-NeRF fallback: single MSE on log-mags
-        mse = F.mse_loss(pred_log, gt_log)
-        return mse, {"mse": mse.detach()}, None
+
+        # ---------- AV-NeRF MSE loss ----------
+        else:  # "avnerf"
+            parts = {}
+            parts["mse"] = F.mse_loss(pred_log, gt_log)
+            total = self.loss_factor * parts["mse"]   # 🔥 SAME GLOBAL SCALE
+            return total, parts, None
 
     @staticmethod
     def _format_parts(parts_dict, edc_val):

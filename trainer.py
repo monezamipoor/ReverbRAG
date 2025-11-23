@@ -8,7 +8,7 @@ from decay_features import build_ref_decay_features_bank
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
+# from torch.cuda.amp import autocast, GradScaler
 from tqdm.auto import tqdm
 from torchaudio.transforms import GriffinLim
 
@@ -76,7 +76,7 @@ class Trainer:
         self.device = device
         self.baseline = baseline.lower()
         self.run_cfg = run_cfg
-        self.scaler = GradScaler(enabled=True)
+        # self.scaler = GradScaler(enabled=True)
         self.log_every = int(run_cfg.get("log_every", 50))
         # STFT/ISTFT & Evaluator (parameters taken “from main.py”)
         fs = int(run_cfg.get("sample_rate", 48000))
@@ -214,13 +214,14 @@ class Trainer:
             refs_logmag, refs_mask = self._gather_refs(ref_idx)
             refs_feats = self._gather_ref_feats(ref_idx)
 
-        with autocast(True):
-            pred = self.model(
-                mic_xyz=mic, src_xyz=src, head_dir=head, t_idx=t_idx,
-                visual_feat=vfeat,
-                refs_logmag=refs_logmag, refs_mask=refs_mask,    # <— existing
-                refs_feats=refs_feats,                            # <— NEW
-            )
+        # pure FP32 forward, like AV-NeRF
+        pred = self.model(
+            mic_xyz=mic, src_xyz=src, head_dir=head, t_idx=t_idx,
+            visual_feat=vfeat,
+            refs_logmag=refs_logmag, refs_mask=refs_mask,
+            refs_feats=refs_feats,
+        )
+
         return pred
 
     # ---- compact EDC loss (computed on full STFT batches only) ----
@@ -464,8 +465,7 @@ class Trainer:
 
 
                 self.optimizer.zero_grad(set_to_none=True)
-                self.scaler.scale(total).backward()
-                self.scaler.unscale_(self.optimizer)
+                total.backward()
                 
                 # ================================
                 #   HARD DEBUG: LOSS WENT NaN
@@ -584,11 +584,9 @@ class Trainer:
                     })
 
                 
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                self.optimizer.step()
 
                 lr = self._update_lr(step, len(train_loader), epochs, self.baseline)
-
 
                 # ---- richer logging ----
                 parts_log = self._format_parts(parts, edc_val)

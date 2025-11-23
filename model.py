@@ -323,6 +323,40 @@ class UnifiedReverbRAGModel(nn.Module):
         if hasattr(self.rag_gen, "set_logger"):
             self.rag_gen.set_logger(logger)
 
+    # def forward(
+    #     self,
+    #     mic_xyz: torch.Tensor,
+    #     src_xyz: torch.Tensor,
+    #     head_dir: torch.Tensor,
+    #     t_idx: torch.Tensor,
+    #     visual_feat: torch.Tensor,
+    #     refs_logmag: torch.Tensor = None,   # [B,K,1,F,60]
+    #     refs_mask: torch.Tensor = None,     # [B,K]
+    #     refs_feats: torch.Tensor = None,    # [B,K,32,4]
+    # ) -> torch.Tensor:
+
+    #     # --- input mode: build h BEFORE encoder and inject as aux ---
+    #     aux = None
+    #     if self.use_rag and (self.fusion == "input"):
+    #         h = self.rag_gen.build_h(refs_feats, refs_mask)           # [B,h_dim] or None
+    #         aux = self.rag_gen.project_aux(h)                         # [B,W] or None
+
+    #     if self.encoder_kind == "neraf":
+    #         w = self.encoder(mic_xyz, src_xyz, head_dir, t_idx, visual_feat, self.aabb, aux=aux)  # [B,T,W]
+    #         if self.use_rag and self.fusion in ("film", "concat"):
+    #             w = self.rag_gen.pre_fuse(w, refs_logmag, refs_mask, refs_feats)
+    #         return self.decoder(w)
+
+    #     # AV-NeRF path: orientation to decoder
+    #     w = self.encoder(mic_xyz, src_xyz, t_idx, visual_feat, self.aabb, aux=aux)
+    #     B, T = t_idx.shape[0], t_idx.shape[1]
+    #     rot_e = self.rot_encoding(head_dir).unsqueeze(1).expand(B, T, -1).contiguous()
+
+    #     if self.use_rag and self.fusion in ("film", "concat"):
+    #         w = self.rag_gen.pre_fuse(w, refs_logmag, refs_mask, refs_feats)
+
+    #     return self.decoder(w, dir_cond=rot_e)
+    
     def forward(
         self,
         mic_xyz: torch.Tensor,
@@ -330,29 +364,58 @@ class UnifiedReverbRAGModel(nn.Module):
         head_dir: torch.Tensor,
         t_idx: torch.Tensor,
         visual_feat: torch.Tensor,
-        refs_logmag: torch.Tensor = None,   # [B,K,1,F,60]
-        refs_mask: torch.Tensor = None,     # [B,K]
-        refs_feats: torch.Tensor = None,    # [B,K,32,4]
+        refs_logmag: torch.Tensor = None,
+        refs_mask: torch.Tensor = None,
+        refs_feats: torch.Tensor = None,
     ) -> torch.Tensor:
 
-        # --- input mode: build h BEFORE encoder and inject as aux ---
+        def _check(name, t):
+            if t is None:
+                return
+            if not torch.isfinite(t).all():
+                print(f"[NaN BUG] non-finite {name}")
+                print(f"  {name} min/max:", t.min().item(), t.max().item())
+                raise RuntimeError(f"NaN in {name}")
+
+        # ---- inputs ----
+        _check("mic_xyz", mic_xyz)
+        _check("src_xyz", src_xyz)
+        _check("head_dir", head_dir)
+        _check("t_idx", t_idx)
+        _check("visual_feat", visual_feat)
+        _check("refs_logmag", refs_logmag)
+        _check("refs_mask", refs_mask.float() if refs_mask is not None else None)
+        _check("refs_feats", refs_feats)
+
+        # ---- optional RAG 'input' fusion: build_h / project_aux ----
         aux = None
         if self.use_rag and (self.fusion == "input"):
-            h = self.rag_gen.build_h(refs_feats, refs_mask)           # [B,h_dim] or None
-            aux = self.rag_gen.project_aux(h)                         # [B,W] or None
+            h = self.rag_gen.build_h(refs_feats, refs_mask)
+            _check("rag_build_h", h)
 
+            aux = self.rag_gen.project_aux(h) if h is not None else None
+            _check("rag_project_aux", aux)
+
+        # ---- encoder ----
         if self.encoder_kind == "neraf":
-            w = self.encoder(mic_xyz, src_xyz, head_dir, t_idx, visual_feat, self.aabb, aux=aux)  # [B,T,W]
-            if self.use_rag and self.fusion in ("film", "concat"):
-                w = self.rag_gen.pre_fuse(w, refs_logmag, refs_mask, refs_feats)
-            return self.decoder(w)
+            w = self.encoder(mic_xyz, src_xyz, head_dir, t_idx, visual_feat, self.aabb, aux=aux)
+        else:
+            w = self.encoder(mic_xyz, src_xyz, t_idx, visual_feat, self.aabb, aux=aux)
+        _check("encoder_out", w)
 
-        # AV-NeRF path: orientation to decoder
-        w = self.encoder(mic_xyz, src_xyz, t_idx, visual_feat, self.aabb, aux=aux)
-        B, T = t_idx.shape[0], t_idx.shape[1]
-        rot_e = self.rot_encoding(head_dir).unsqueeze(1).expand(B, T, -1).contiguous()
-
+        # ---- RAG fusion (film / concat) ----
         if self.use_rag and self.fusion in ("film", "concat"):
             w = self.rag_gen.pre_fuse(w, refs_logmag, refs_mask, refs_feats)
+            _check("rag_pre_fuse", w)
 
-        return self.decoder(w, dir_cond=rot_e)
+        # ---- decoder ----
+        if self.encoder_kind == "neraf":
+            out = self.decoder(w)
+        else:
+            B, T = t_idx.shape[0], t_idx.shape[1]
+            rot_e = self.rot_encoding(head_dir).unsqueeze(1).expand(B, T, -1).contiguous()
+            _check("rot_e", rot_e)
+            out = self.decoder(w, dir_cond=rot_e)
+
+        _check("decoder_out", out)
+        return out

@@ -283,14 +283,13 @@ class Trainer:
         if self.baseline == "neraf":
             parts = self.loss_fn(pred_log, gt_log)
             total = 0.1 * parts["audio_sc_loss"] + 1.0 * parts["audio_mag_loss"]
-            total = self.loss_factor * total   # APPLY GLOBAL SCALE
             return total, parts, None
 
         # ---------- AV-NeRF MSE loss ----------
         else:  # "avnerf"
             parts = {}
             parts["mse"] = F.mse_loss(pred_log, gt_log)
-            total = self.loss_factor * parts["mse"]   # 🔥 SAME GLOBAL SCALE
+            total = parts["mse"]   # 🔥 SAME GLOBAL SCALE
             return total, parts, None
 
     @staticmethod
@@ -471,7 +470,7 @@ class Trainer:
                         total = total + self.lambda_edc * edc_term
                         edc_val = edc_term.detach()
 
-
+                total = total * self.loss_factor  # APPLY GLOBAL SCALE
                 self.optimizer.zero_grad(set_to_none=True)
                 total.backward()
                 

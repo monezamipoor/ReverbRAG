@@ -42,7 +42,7 @@ databases:
 
 reverbrag:
   enabled: false
-  fusion: concat         # {film | concat | input}
+  fusion: film         # {film | concat | input}
   k: 1                      # we only use top-1 here
   num_bands: 32             # features are [32 x 4]
   gating: true              # enable scalar gate
@@ -53,5 +53,5 @@ reverbrag:
   feature_norm: "layernorm"
 
   # FiLM parameters
-  film_strength: 0.3        # near-identity at init
+  film_strength: 0.15        # near-identity at init
   learnable_film: true      # make scales learnable (recommended)

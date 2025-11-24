@@ -317,6 +317,7 @@ class UnifiedReverbRAGModel(nn.Module):
             self.rag_gen = ReverbRAGGenerator(cfg=rag_cfg, W=cfg.W_field)
         else:
             self.rag_gen = None
+        self.token_norm = nn.LayerNorm(cfg.W_field)
 
     def set_logger(self, logger):
         self._logger = logger
@@ -401,6 +402,8 @@ class UnifiedReverbRAGModel(nn.Module):
             w = self.encoder(mic_xyz, src_xyz, head_dir, t_idx, visual_feat, self.aabb, aux=aux)
         else:
             w = self.encoder(mic_xyz, src_xyz, t_idx, visual_feat, self.aabb, aux=aux)
+            
+        w = self.token_norm(w)
         _check("encoder_out", w)
 
         # ---- RAG fusion (film / concat) ----

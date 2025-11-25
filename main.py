@@ -46,8 +46,9 @@ def build_train_loader(cfg, dataset):
     Prints clear diagnostics and estimated steps/epoch.
     """
     sc   = copy.deepcopy(cfg.get("sampler", {}))
-    run  = cfg.get("run", {}) or {}
-    edc_w = float(run.get("edc_loss", 0.0))  # your config key
+    cfg  = cfg.get("run", {}) or {}
+    loss_cfg = cfg.get("losses", {}) or {}
+    edc_w = float(loss_cfg.get("edc", cfg.get("edc_loss", 0.0)))
     shuffle      = bool(sc.get("shuffle", True))
     num_workers  = int(sc.get("num_workers", 0))
     use_persist  = num_workers > 0
@@ -245,7 +246,7 @@ def main():
         baseline=baseline, database=database,
         scene_root=root, scene_name=scene,
         sample_rate=fs, W_field=1024, scene_aabb=train_ds.scene_box.aabb,
-        reverbrag=cfg.get("reverbrag", {}),
+        opt=cfg.get("model", {}),
     )
 
     model = UnifiedReverbRAGModel(mcfg).to(device)

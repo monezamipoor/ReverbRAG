@@ -6,15 +6,22 @@ run:
   scene: FurnishedRoom        # e.g., EmptyRoom, FurnishedRoom
   sample_rate: 48000
   epochs: 100
-  edc_loss: 0.0               # weight for EDC loss; 0.0 to disable EDC training
-
-  # NEW – checkpointing & resume
   save_root: ./checkpoints          # root for run folders
   save_every: 10              # save every N epochs
   resume:
     checkpoint: null        # e.g., ./runs/raf/FurnishedRoom/20251106-2130_base/epoch_50.pt
     load_optimizer: false     # if true, restore optimizer state (and LR scheduler progress)
     lr_override: null         # e.g., 1e-4; if set, forces this LR after resume
+
+  losses:
+    sc: 0.1              # weight for spectral convergence loss
+    mag: 1.0             # weight for log-magnitude loss
+    mag_loss_type: mse   # {l1 | mse} for the log-mag term
+    mse: 0.0             # set >0 to add F.mse_loss(log_pred, log_gt)
+    # EDC loss (forces full-STFT sampler when > 0)
+    edc: 0.3             # 0.0 disables EDC
+    # Global scale for the total loss (applied at the end)
+    global_scale: 1.0e-3
 
 renders:
   save_renders: ./renders   # set to null to disable
@@ -40,18 +47,39 @@ databases:
   soundspaces:
     root: /data/SoundSpaces
 
-reverbrag:
-  enabled: false
-  fusion: film         # {film | concat | input}
-  k: 1                      # we only use top-1 here
-  num_bands: 32             # features are [32 x 4]
-  gating: true              # enable scalar gate
+model:
 
-  # reference MLP over 32x4 features
-  mlp_hidden: [128, 256, 256]
-  mlp_act: lrelu             # {gelu | relu | lrelu | silu}
-  feature_norm: "layernorm"
+  envelope:
+    enabled: false                # flip this off for ablations
+    hidden: [512, 256, 256, 128]  # 4-layer MLP
+    act: lrelu                    # {relu | lrelu | gelu | silu}
+    tanh_scale: 0.0               # scale for tanh-bounded log envelope
+    n_frames: 60                  # expected T; matches EDC bins
+    normalize: true               # normalize residual STFT mags
+    combine_mode: "log"           # or "log" how to combine envelope + detail
 
-  # FiLM parameters
-  film_strength: 0.15        # near-identity at init
-  learnable_film: true      # make scales learnable (recommended)
+  reverbrag:
+    enabled: false
+    fusion: film         # {film | concat | input}
+    k: 1                      # we only use top-1 here
+    num_bands: 32             # features are [32 x 4]
+    gating: true              # enable scalar gate
+
+    # reference MLP over 32x4 features
+    mlp_hidden: [128, 256, 256]
+    mlp_act: lrelu             # {gelu | relu | lrelu | silu}
+    feature_norm: "layernorm"
+
+    # FiLM parameters
+    film_strength: 0.15        # near-identity at init
+    learnable_film: true      # make scales learnable (recommended)
+
+
+  neraf_encoder:
+    hidden: [5096, 2048, 1024, 1024]
+  avnerf_encoder:
+    hidden: [5096, 2048, 1024, 1024]
+  decoder:
+    # empty list = single Linear(W, N_freq) per channel (old behaviour)
+    # e.g. [2048, 1024] would give W -> 2048 -> 1024 -> N_freq
+    hidden: []

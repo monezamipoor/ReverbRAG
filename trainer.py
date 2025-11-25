@@ -122,16 +122,38 @@ class Trainer:
             self.ref_bank = None
             self.ref_feats = None
 
-        # Loss (different per baseline)
-        if self.baseline == "neraf":
-            self.loss_fn = STFTLoss(loss_type='mse')
-        else:  # "avnerf": keep it simple & faithful to their MSE-on-mags spirit
-            self.loss_fn = None  # using a compact bi/mono-agnostic MSE on log-mags
-        # EDC batching requirement (full-sequence batches only)
-        self.lambda_edc = float(run_cfg.get("edc_loss", 0.0))  # e.g., 0.2
-        self.use_edc_full = bool(run_cfg.get("edc_full", False))
+        # ---- Loss configuration (fully config-driven; no baseline assumptions) ----
+        loss_cfg = run_cfg.get("losses", {}) or {}
+        # ---- Print final resolved losses (debug) ----
+        print("\n================ LOSS CONFIG ================")
+        for k, v in loss_cfg.items():
+            print(f"{k:12s} : {v}")
+        print("=============================================\n")
+
+        # NeRAF-style STFT loss (SC + log-mag)
+        mag_loss_type = loss_cfg.get("mag_loss_type", "mse")  # { "l1", "mse" }
+        self.loss_fn = STFTLoss(loss_type=mag_loss_type)
+
+        # Weights for each term
+        self.w_sc  = float(loss_cfg.get("sc", 0.0))   # spectral convergence
+        self.w_mag = float(loss_cfg.get("mag", 0.0))  # log-mag
+        self.w_mse = float(loss_cfg.get("mse", 0.0))  # extra log-mse
+
+        # EDC weighting (support both new `losses.edc` and old `edc_loss`)
+        self.lambda_edc = float(
+            loss_cfg.get("edc", run_cfg.get("edc_loss", 0.0))
+        )
+
+        # This flag is now basically informational; EDC behaviour is tied to lambda_edc
+        self.use_edc_full = bool(
+            run_cfg.get("edc_full", self.lambda_edc > 0.0)
+        )
         self._warned_slice_edc = False
-        self.loss_factor = float(run_cfg.get("loss_factor", 1e-3))
+
+        # Global scale for the final loss
+        self.loss_factor = float(
+            loss_cfg.get("global_scale", run_cfg.get("loss_factor", 1e-3))
+        )
 
         # Optimizer (abstract; two presets)
         if self.baseline == "avnerf":
@@ -277,20 +299,31 @@ class Trainer:
                 return torch.sqrt(per_s.clamp_min(1e-8)).mean()
 
     def _loss(self, pred_log, gt_log):
-        pred_log = pred_log.float(); gt_log = gt_log.float()
+        pred_log = pred_log.float()
+        gt_log   = gt_log.float()
 
-        # ---------- NeRAF STFT loss ----------
-        if self.baseline == "neraf":
-            parts = self.loss_fn(pred_log, gt_log)
-            total = 0.1 * parts["audio_sc_loss"] + 1.0 * parts["audio_mag_loss"]
-            return total, parts, None
+        parts = {}
+        total = 0.0
 
-        # ---------- AV-NeRF MSE loss ----------
-        else:  # "avnerf"
-            parts = {}
-            parts["mse"] = F.mse_loss(pred_log, gt_log)
-            total = parts["mse"]   # 🔥 SAME GLOBAL SCALE
-            return total, parts, None
+        # ----- STFT-based losses (SC + log-mag) -----
+        if self.w_sc != 0.0 or self.w_mag != 0.0:
+            stft_parts = self.loss_fn(pred_log, gt_log)  # returns {"audio_sc_loss", "audio_mag_loss"}
+            parts.update(stft_parts)
+
+            if self.w_sc != 0.0:
+                total = total + self.w_sc * stft_parts["audio_sc_loss"]
+            if self.w_mag != 0.0:
+                total = total + self.w_mag * stft_parts["audio_mag_loss"]
+
+        # ----- Extra log-MSE term (AV-NeRF-style) -----
+        if self.w_mse != 0.0:
+            mse_val = F.mse_loss(pred_log, gt_log)
+            parts["mse"] = mse_val
+            total = total + self.w_mse * mse_val
+
+        # If you set all weights to 0.0, total == 0 and you’ve soft-bricked training.
+        return total, parts, None
+
 
     @staticmethod
     def _format_parts(parts_dict, edc_val):

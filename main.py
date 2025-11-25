@@ -48,7 +48,8 @@ def build_train_loader(cfg, dataset):
     sc   = copy.deepcopy(cfg.get("sampler", {}))
     cfg  = cfg.get("run", {}) or {}
     loss_cfg = cfg.get("losses", {}) or {}
-    edc_w = float(loss_cfg.get("edc", cfg.get("edc_loss", 0.0)))
+    edc_w     = float(loss_cfg.get("edc", 0.0))
+    env_rms_w = float(loss_cfg.get("env_rms", 0.0))
     shuffle      = bool(sc.get("shuffle", True))
     num_workers  = int(sc.get("num_workers", 0))
     use_persist  = num_workers > 0
@@ -57,7 +58,7 @@ def build_train_loader(cfg, dataset):
     total_slices = len(dataset)
     est_num_rirs = total_slices // T
 
-    if edc_w > 0.0:
+    if (edc_w > 0.0) or (env_rms_w > 0.0):
         # EDC mode: use RIRs-per-batch knob
         rpb = int(sc.get("rirs_per_batch", 40))
         bs_slices = rpb * T

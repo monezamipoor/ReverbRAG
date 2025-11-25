@@ -430,6 +430,7 @@ class UnifiedReverbRAGModel(nn.Module):
             self.env_n_frames = None
         self.normalize_residual = env_cfg.get("normalize", True)
         self.use_envelope = env_cfg.get("enabled", False)
+        self.debug_outputs = {}
 
     def set_logger(self, logger):
         self._logger = logger
@@ -513,6 +514,10 @@ class UnifiedReverbRAGModel(nn.Module):
         # log_env_full: [B, T_env], t_long: [B, T_cur]
         log_env = log_env_full.gather(1, t_long)              # [B, T_cur]
         log_env_bt = log_env.view(B, 1, 1, T_cur)             # [B,1,1,T_cur]
+        
+        # store envelope predictions for diagnostics / future losses
+        self.debug_outputs["log_env_full"] = log_env_full     # [B, T_env]
+        self.debug_outputs["log_env_bt"]   = log_env_bt       # [B,1,1,T_cur]
 
         # ==== combine envelope & residual ====
         if self.env_combine_mode == "log":
@@ -542,7 +547,8 @@ class UnifiedReverbRAGModel(nn.Module):
         refs_mask: torch.Tensor = None,
         refs_feats: torch.Tensor = None,
     ) -> torch.Tensor:
-
+        
+        self.debug_outputs = {} # reset additional outputs
         # ---- optional RAG 'input' fusion: build_h / project_aux ----
         aux = None
         if self.use_rag and (self.fusion == "input"):
@@ -573,6 +579,9 @@ class UnifiedReverbRAGModel(nn.Module):
         # zero-mean residual over freq per time
         if self.normalize_residual and self.use_envelope:
             r_log = r_log - r_log.mean(dim=2, keepdim=True)  # [B,C,F,T]
+        # expose residual for extra losses / debugging
+        if self.use_envelope:
+            self.debug_outputs["residual_log"] = r_log
 
         # ---- envelope fusion ----
         log_pred, log_env = self._apply_envelope(c, r_log, t_idx)

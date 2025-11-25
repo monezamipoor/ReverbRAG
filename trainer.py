@@ -74,7 +74,6 @@ class Trainer:
     ):
         self.model = model.to(device)
         self.device = device
-        self.baseline = baseline.lower()
         self.run_cfg = run_cfg
         # self.scaler = GradScaler(enabled=True)
         self.log_every = int(run_cfg.get("log_every", 50))
@@ -124,6 +123,7 @@ class Trainer:
 
         # ---- Loss configuration (fully config-driven; no baseline assumptions) ----
         loss_cfg = run_cfg.get("losses", {}) or {}
+        self.baseline = loss_cfg.get("optimizer", "avnerf")
         # ---- Print final resolved losses (debug) ----
         print("\n================ LOSS CONFIG ================")
         for k, v in loss_cfg.items():
@@ -138,6 +138,9 @@ class Trainer:
         self.w_sc  = float(loss_cfg.get("sc", 0.0))   # spectral convergence
         self.w_mag = float(loss_cfg.get("mag", 0.0))  # log-mag
         self.w_mse = float(loss_cfg.get("mse", 0.0))  # extra log-mse
+        # Envelope + residual regularization
+        self.w_env_rms = float(loss_cfg.get("env_rms", 0.0))  # RMS envelope (log-domain, full STFT)
+        self.w_res_l2  = float(loss_cfg.get("res_l2", 0.0))   # L2 penalty on residual log-STFT
 
         # EDC weighting (support both new `losses.edc` and old `edc_loss`)
         self.lambda_edc = float(
@@ -247,6 +250,50 @@ class Trainer:
 
         return pred
 
+    def _env_rms_loss(self, pred_log: torch.Tensor, gt_log: torch.Tensor) -> torch.Tensor:
+        """
+        Global RMS envelope supervision on FULL STFTs.
+
+        Args:
+            pred_log: [B, C, F, T] or [B, 1, F, T] log-magnitude prediction
+            gt_log:   same shape as pred_log
+
+        Returns:
+            scalar MSE loss between log RMS envelopes [B, T].
+        """
+        assert pred_log.shape[-1] == 60, "env_rms expects full STFT with T=60 frames"
+
+        # no AMP weirdness inside this calculation
+        with torch.cuda.amp.autocast(enabled=False):
+            pred_log32 = pred_log.float()
+            gt_log32   = gt_log.float()
+
+            # ensure [B, C, F, T]
+            if pred_log32.dim() == 3:
+                pred_log32 = pred_log32.unsqueeze(1)
+                gt_log32   = gt_log32.unsqueeze(1)
+
+            # convert to magnitude
+            mag_pred = (pred_log32.exp() - 1e-3).clamp_min(0.0)   # [B,C,F,T]
+            mag_gt   = (gt_log32.exp()   - 1e-3).clamp_min(0.0)
+
+            # energy over freq, then average over channels -> [B, T]
+            E_pred = (mag_pred ** 2).sum(dim=-2)   # [B,C,T]
+            E_gt   = (mag_gt   ** 2).sum(dim=-2)
+
+            if E_pred.dim() == 3:
+                E_pred = E_pred.mean(dim=-3)       # [B,T]
+                E_gt   = E_gt.mean(dim=-3)
+
+            rms_pred = torch.sqrt(E_pred + 1e-8)   # [B,T]
+            rms_gt   = torch.sqrt(E_gt   + 1e-8)
+
+            log_rms_pred = torch.log(rms_pred + 1e-6)
+            log_rms_gt   = torch.log(rms_gt   + 1e-6)
+
+            return F.mse_loss(log_rms_pred, log_rms_gt)
+
+
     # ---- compact EDC loss (computed on full STFT batches only) ----
     def _edc_loss(self, pred_log: torch.Tensor, gt_log: torch.Tensor,
                 valid_mask: Optional[torch.Tensor] = None,
@@ -320,6 +367,16 @@ class Trainer:
             mse_val = F.mse_loss(pred_log, gt_log)
             parts["mse"] = mse_val
             total = total + self.w_mse * mse_val
+            
+        # ----- Residual L2 regularization (envelope branch) -----
+        if self.w_res_l2 != 0.0:
+            dbg = getattr(self.model, "debug_outputs", None)
+            if isinstance(dbg, dict):
+                r_log = dbg.get("residual_log", None)
+                if r_log is not None:
+                    res_l2 = (r_log ** 2).mean()
+                    parts["res_l2"] = res_l2
+                    total = total + self.w_res_l2 * res_l2
 
         # If you set all weights to 0.0, total == 0 and you’ve soft-bricked training.
         return total, parts, None
@@ -331,7 +388,6 @@ class Trainer:
         if edc_val is not None:
             flat["edc_loss"] = float(edc_val.item())
         return flat
-
 
     def _update_lr(self, step_idx: int, steps_per_epoch: int, max_epoch: int, baseline: str):
         if baseline == "avnerf":
@@ -475,34 +531,62 @@ class Trainer:
                 total, parts, edc_val = self._loss(pred, gt)
 
                 # inside train() loop, after total, parts, edc_val = self._loss(...)
-                if self.lambda_edc > 0.0:
+                # EDC and/or global envelope RMS both need full STFTs
+                if (self.lambda_edc > 0.0) or (self.w_env_rms > 0.0):
                     bs_obj = getattr(train_loader, "batch_sampler", None)
                     sampler_name = type(bs_obj).__name__ if bs_obj is not None else type(train_loader.sampler).__name__
 
                     if is_slice:
-                        # require contiguous T slices per SID to pack
+                        # slice mode: we expect EDCFullBatchSampler to give contiguous T slices per RIR
                         if sampler_name != "EDCFullBatchSampler":
-                            if not getattr(self, "_warned_sampler", False):
+                            if self.w_env_rms > 0.0:
+                                raise RuntimeError(
+                                    "env_rms > 0 requires EDCFullBatchSampler (contiguous T slices per RIR)."
+                                )
+                            # only EDC is on -> just warn once
+                            if self.lambda_edc > 0.0 and not getattr(self, "_warned_sampler", False):
                                 print("[warn] EDC loss expects EDCFullBatchSampler (contiguous T slices per SID).")
                                 self._warned_sampler = True
                         else:
                             T = int(getattr(train_loader.dataset, "max_frames", 60))
                             if (gt.shape[0] % T) == 0:
+                                # pack slices -> full [B, C, F, T]
                                 pred_full = self._pack_slices_to_full(pred, T)
                                 gt_full   = self._pack_slices_to_full(gt,   T)
-                                edc_term  = self._edc_loss(pred_full, gt_full, valid_mask=None, p=1)
-                                total = total + self.lambda_edc * edc_term
-                                edc_val = edc_term.detach()
+
+                                # EDC term (optional)
+                                if self.lambda_edc > 0.0:
+                                    edc_term = self._edc_loss(pred_full, gt_full, valid_mask=None, p=1)
+                                    total = total + self.lambda_edc * edc_term
+                                    edc_val = edc_term.detach()
+
+                                # Envelope RMS term (optional)
+                                if self.w_env_rms > 0.0:
+                                    env_term = self._env_rms_loss(pred_full, gt_full)
+                                    parts["env_rms"] = env_term
+                                    total = total + self.w_env_rms * env_term
                             else:
-                                if not getattr(self, "_warned_slice_edc", False):
-                                    print("[warn] cannot pack slices (batch not multiple of T). Skipping EDC term this step.")
+                                # batch not divisible by T -> cannot pack full RIRs
+                                msg = "[warn] cannot pack slices (batch not multiple of T)."
+                                if self.w_env_rms > 0.0:
+                                    raise RuntimeError(msg + " env_rms requires full RIRs per batch.")
+                                if self.lambda_edc > 0.0 and not getattr(self, "_warned_slice_edc", False):
+                                    print(msg + " Skipping EDC term this step.")
                                     self._warned_slice_edc = True
                     else:
-                        # full batches: compute EDC directly (already full 60 frames)
-                        edc_term = self._edc_loss(pred, gt, valid_mask=None, p=1)
-                        total = total + self.lambda_edc * edc_term
-                        edc_val = edc_term.detach()
+                        # full batches: pred and gt already [B, C, F, T]
+                        if self.lambda_edc > 0.0:
+                            edc_term = self._edc_loss(pred, gt, valid_mask=None, p=1)
+                            total = total + self.lambda_edc * edc_term
+                            edc_val = edc_term.detach()
 
+                        if self.w_env_rms > 0.0:
+                            env_term = self._env_rms_loss(pred, gt)
+                            parts["env_rms"] = env_term
+                            total = total + self.w_env_rms * env_term
+                            
+                # ---- finalize loss and backward ----
+                total_unscaled = total.detach()
                 total = total * self.loss_factor  # APPLY GLOBAL SCALE
                 self.optimizer.zero_grad(set_to_none=True)
                 total.backward()
@@ -631,15 +715,38 @@ class Trainer:
                 # ---- richer logging ----
                 parts_log = self._format_parts(parts, edc_val)
                 if wandb_run:
-                    wandb_log = {"train/loss": float(total.item()), "train/lr": float(lr)}
+                    wandb_log = {
+                        "train/loss": float(total.item()),
+                        "train/lr":   float(lr),
+                    }
                     for k, v in parts_log.items():
                         wandb_log[f"train/{k}"] = v
-                    if edc_val is not None:
+
+                    # ----- per-term shares in TOTAL UN-SCALED loss -----
+                    eps = 1e-12
+                    denom = float(total_unscaled.item()) + eps
+
+                    # EDC share (if present)
+                    if edc_val is not None and self.lambda_edc != 0.0:
                         edc_w = float(self.lambda_edc)
-                        edc_share = float((edc_w * edc_val) / (total + 1e-12))
-                        wandb_log["train/edc_loss"] = float(edc_val)
-                        wandb_log["train/edc_share"] = edc_share  # NEW
+                        edc_share = float((edc_w * edc_val.item()) / denom)
+                        wandb_log["train/edc_loss"]  = float(edc_val.item())
+                        wandb_log["train/edc_share"] = edc_share
+
+                    # Envelope RMS share
+                    if ("env_rms" in parts) and (self.w_env_rms != 0.0):
+                        env_term  = float(parts["env_rms"].item())
+                        env_share = float((self.w_env_rms * env_term) / denom)
+                        wandb_log["train/env_rms_share"] = env_share
+
+                    # Residual L2 regularizer share
+                    if ("res_l2" in parts) and (self.w_res_l2 != 0.0):
+                        res_term  = float(parts["res_l2"].item())
+                        res_share = float((self.w_res_l2 * res_term) / denom)
+                        wandb_log["train/res_l2_share"] = res_share
+
                     wandb_run.log(wandb_log)
+                # ---- progress bar update ----
                 pbar.set_postfix({"loss": float(total.item())})
                 pbar.update(1)
                 step += 1

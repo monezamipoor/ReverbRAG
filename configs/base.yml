@@ -14,14 +14,18 @@ run:
     lr_override: null         # e.g., 1e-4; if set, forces this LR after resume
 
   losses:
-    sc: 0.1              # weight for spectral convergence loss
-    mag: 1.0             # weight for log-magnitude loss
+    sc: 0.0              # weight for spectral convergence loss
+    mag: 0.0             # weight for log-magnitude loss
     mag_loss_type: mse   # {l1 | mse} for the log-mag term
-    mse: 0.0             # set >0 to add F.mse_loss(log_pred, log_gt)
+    mse: 1.0             # set >0 to add F.mse_loss(log_pred, log_gt)
     # EDC loss (forces full-STFT sampler when > 0)
-    edc: 0.3             # 0.0 disables EDC
+    edc: 0.2             # 0.0 disables EDC
+    # Envelope / residual regularization
+    env_rms: 0.0         # weight for global RMS envelope loss (log-domain, uses full STFT)
+    res_l2: 0.0          # L2 regularization on residual log-STFT
     # Global scale for the total loss (applied at the end)
     global_scale: 1.0e-3
+    optimizer: avnerf    # {neraf | avnerf} selects which pred to use for loss
 
 renders:
   save_renders: ./renders   # set to null to disable
@@ -40,7 +44,6 @@ wandb:
   project: ReverbRAG
   api_key: null    # optional; leave null if you've already `wandb login`
 
-
 databases:
   raf:
     root: ../NeRAF/data/RAF
@@ -55,7 +58,7 @@ model:
     act: lrelu                    # {relu | lrelu | gelu | silu}
     tanh_scale: 0.0               # scale for tanh-bounded log envelope
     n_frames: 60                  # expected T; matches EDC bins
-    normalize: true               # normalize residual STFT mags
+    normalize: false               # normalize residual STFT mags
     combine_mode: "log"           # or "log" how to combine envelope + detail
 
   reverbrag:
@@ -73,7 +76,6 @@ model:
     # FiLM parameters
     film_strength: 0.15        # near-identity at init
     learnable_film: true      # make scales learnable (recommended)
-
 
   neraf_encoder:
     hidden: [5096, 2048, 1024, 1024]

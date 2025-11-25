@@ -295,55 +295,65 @@ class Trainer:
 
 
     # ---- compact EDC loss (computed on full STFT batches only) ----
-    def _edc_loss(self, pred_log: torch.Tensor, gt_log: torch.Tensor,
-                valid_mask: Optional[torch.Tensor] = None,
-                p=1, eps=1e-8) -> torch.Tensor:
+    def _edc_loss(
+        self,
+        pred_log: torch.Tensor,   # [B, C, F, T] log-mag
+        gt_log:   torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        """
+        NeRAF-style EDC:
+          - magnitude = exp(log) - 1e-3
+          - per-frame energy: sum_f mag^2
+          - Schroeder integral over time
+          - L1 on log10 energy curves (no z-score, no 0 dB anchoring)
+        """
         assert pred_log.shape[-1] == 60
-        # --- force fp32, no autocast ---
+
         with torch.cuda.amp.autocast(enabled=False):
             pred_log32 = pred_log.float()
             gt_log32   = gt_log.float()
 
+            # mag reconstruction identical to NeRAF
             pred_mag = (pred_log32.exp() - 1e-3).clamp_min(0.0)
             gt_mag   = (gt_log32.exp()   - 1e-3).clamp_min(0.0)
 
-            E_pred = (pred_mag**2).sum(dim=-2)
-            E_gt   = (gt_mag**2).sum(dim=-2)
-            if E_pred.dim() == 3:
-                E_pred = E_pred.sum(dim=-3)
-                E_gt   = E_gt.sum(dim=-3)
+            # energy per frame: sum over F, keep channels separate
+            # E: [B, C, T] or [B, T] if no channel dim
+            if pred_mag.dim() == 4:
+                E_pred = (pred_mag**2).sum(dim=-2)        # [B, C, T]
+                E_gt   = (gt_mag**2).sum(dim=-2)
+            else:
+                E_pred = (pred_mag**2).sum(dim=-2)        # [B, T]
+                E_gt   = (gt_mag**2).sum(dim=-2)
 
+            # Schroeder integral over time (last dim)
             S_pred = torch.flip(torch.cumsum(torch.flip(E_pred, dims=[-1]), dim=-1), dims=[-1])
             S_gt   = torch.flip(torch.cumsum(torch.flip(E_gt,   dims=[-1]), dim=-1), dims=[-1])
 
-            # clamp BEFORE log10, in fp32
-            floor = 1e-8
-            s_pred = 10.0 * torch.log10(S_pred.clamp_min(floor))
-            s_gt   = 10.0 * torch.log10(S_gt  .clamp_min(floor))
+            # log10 in energy domain (no 0 dB anchoring, no z-score)
+            s_pred = torch.log10(S_pred.clamp_min(eps))
+            s_gt   = torch.log10(S_gt  .clamp_min(eps))
 
-            B, T = s_pred.shape
-            if valid_mask is None:
-                valid_mask = torch.ones(B, T, dtype=torch.bool, device=s_pred.device)
-
-            s_pred = s_pred - s_pred[:, :1]
-            s_gt   = s_gt   - s_gt[:, :1]
-
-            # z-score on valid frames (safe)
-            cnt = valid_mask.sum(dim=-1, keepdim=True).clamp_min(1)
-            def _std(x, m):
-                mu = (x * m).sum(dim=-1, keepdim=True) / cnt
-                var = ((x - mu)**2 * m).sum(dim=-1, keepdim=True) / cnt
-                return torch.sqrt(var.clamp_min(1e-8))
-            s_pred = s_pred / _std(s_pred, valid_mask)
-            s_gt   = s_gt   / _std(s_gt,   valid_mask)
-
-            diff = (s_pred - s_gt) * valid_mask
-            if p == 1:
-                per_s = diff.abs().sum(dim=-1) / cnt.squeeze(-1)
-                return per_s.mean()
+            # prepare mask
+            if valid_mask is not None:
+                # valid_mask: [B, T] -> broadcast to channels if needed
+                if s_pred.dim() == 3:  # [B, C, T]
+                    m = valid_mask.unsqueeze(1).to(s_pred.dtype)  # [B,1,T]
+                else:                   # [B, T]
+                    m = valid_mask.to(s_pred.dtype)
             else:
-                per_s = diff.pow(2).sum(dim=-1) / cnt.squeeze(-1)
-                return torch.sqrt(per_s.clamp_min(1e-8)).mean()
+                m = torch.ones_like(s_pred, dtype=s_pred.dtype)
+
+            diff = (s_pred - s_gt) * m
+
+            # L1 over time (and channels if present), normalize by #valid
+            denom = m.sum(dim=tuple(range(1, s_pred.dim()))).clamp_min(1.0)  # [B]
+            per_b = diff.abs().sum(dim=tuple(range(1, s_pred.dim()))) / denom
+
+            return per_b.mean()
+        
 
     def _loss(self, pred_log, gt_log):
         pred_log = pred_log.float()
@@ -556,7 +566,7 @@ class Trainer:
 
                                 # EDC term (optional)
                                 if self.lambda_edc > 0.0:
-                                    edc_term = self._edc_loss(pred_full, gt_full, valid_mask=None, p=1)
+                                    edc_term = self._edc_loss(pred_full, gt_full, valid_mask=None)
                                     total = total + self.lambda_edc * edc_term
                                     edc_val = edc_term.detach()
 

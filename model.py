@@ -486,7 +486,8 @@ class UnifiedReverbRAGModel(nn.Module):
 
         Returns:
             log_pred: [B,C,F,T]
-            log_env:  [B,T] or None if envelope disabled
+            log_env:  [B_env,T_env] or None if envelope disabled
+                    (B_env == #RIRs when using EDCFullBatchSampler)
         """
         if (not self.use_envelope) or (self.env_head is None):
             # No envelope: just pass-through residual
@@ -494,30 +495,76 @@ class UnifiedReverbRAGModel(nn.Module):
 
         B, _, _, T_cur = r_log.shape
 
-        # ---- envelope: c -> full log_env over all frames [B, T_env] ----
-        log_env_full = self.env_head(c)                       # [B, T_env]
-
         # ---- map t_idx -> per-frame envelope indices ----
         # t_idx: [B, T, 1] (full) or [B, 1, 1] (slice)
         if t_idx.dim() == 3:
-            t_long = t_idx[..., 0].long()                     # [B, T]
+            t_long = t_idx[..., 0].long()         # [B, T_cur]
         elif t_idx.dim() == 2:
-            t_long = t_idx.long()                             # [B, T]
+            t_long = t_idx.long()                 # [B, T_cur]
         else:
             raise ValueError(f"Unexpected t_idx shape {t_idx.shape}")
 
-        # clamp into valid [0, T_env-1]
-        max_idx = self.env_n_frames - 1 if self.env_n_frames is not None else (log_env_full.shape[1] - 1)
-        t_long = t_long.clamp(0, max_idx)                     # [B, T_cur]
+        # --------------------------------------------------
+        # Case A: full STFT mode (T_cur > 1) -> one envelope per sample
+        # --------------------------------------------------
+        if T_cur > 1:
+            # standard path: B == #RIRs
+            log_env_full = self.env_head(c)       # [B, T_env]
 
-        # gather e_{t} for each sample/time
-        # log_env_full: [B, T_env], t_long: [B, T_cur]
-        log_env = log_env_full.gather(1, t_long)              # [B, T_cur]
-        log_env_bt = log_env.view(B, 1, 1, T_cur)             # [B,1,1,T_cur]
-        
-        # store envelope predictions for diagnostics / future losses
-        self.debug_outputs["log_env_full"] = log_env_full     # [B, T_env]
-        self.debug_outputs["log_env_bt"]   = log_env_bt       # [B,1,1,T_cur]
+            max_idx = self.env_n_frames - 1 if self.env_n_frames is not None else (log_env_full.shape[1] - 1)
+            t_long = t_long.clamp(0, max_idx)     # [B, T_cur]
+
+            log_env   = log_env_full.gather(1, t_long)      # [B, T_cur]
+            log_env_bt = log_env.view(B, 1, 1, T_cur)       # [B,1,1,T_cur]
+
+            # For full mode, B_env == B == #RIRs
+            self.debug_outputs["log_env_full"] = log_env_full   # [B, T_env]
+            self.debug_outputs["log_env_bt"]   = log_env_bt     # [B,1,1,T_cur]
+
+        # --------------------------------------------------
+        # Case B: slice mode with EDCFullBatchSampler (T_cur == 1)
+        #   - B = #RIRs * T_frames  (e.g., 40 * 60 = 2400)
+        #   - We want ONE envelope per RIR, not per slice.
+        # --------------------------------------------------
+        else:
+            if self.env_n_frames is None:
+                raise RuntimeError(
+                    "Envelope: slice mode with T_cur=1 but env_n_frames is None. "
+                    "Set envelope.n_frames in config to match max_frames (e.g., 60)."
+                )
+
+            T_frames = int(self.env_n_frames)
+            if (B % T_frames) != 0:
+                raise RuntimeError(
+                    "Envelope expects EDCFullBatchSampler in slice mode: "
+                    f"batch size B={B} must be a multiple of env_n_frames={T_frames} "
+                    "(#RIRs * T_frames)."
+                )
+
+            B_rir = B // T_frames  # number of distinct RIRs in this batch
+
+            # c: [B_slices, static_dim] where slices for each RIR are contiguous.
+            # Take one context per RIR (first slice of each block).
+            c_rir = c.view(B_rir, T_frames, -1)[:, 0, :]         # [B_rir, static_dim]
+
+            # One envelope per RIR
+            log_env_rir = self.env_head(c_rir)                   # [B_rir, T_env]
+
+            # Now tile envelopes back to slices so we can index with per-slice t_idx
+            log_env_full_slices = log_env_rir.repeat_interleave(T_frames, dim=0)  # [B_slices, T_env]
+
+            # t_long: [B_slices, 1] (since T_cur == 1)
+            max_idx = self.env_n_frames - 1
+            t_long = t_long.clamp(0, max_idx)                    # [B_slices, 1]
+
+            log_env   = log_env_full_slices.gather(1, t_long)    # [B_slices, 1]
+            log_env_bt = log_env.view(B, 1, 1, T_cur)            # [B_slices,1,1,1]
+
+            # For trainer: expose ONE envelope per RIR
+            self.debug_outputs["log_env_full"] = log_env_rir         # [B_rir, T_env]
+            # (optional: keep per-slice version if you want)
+            self.debug_outputs["log_env_full_slices"] = log_env_full_slices  # [B_slices, T_env]
+            self.debug_outputs["log_env_bt"] = log_env_bt
 
         # ==== combine envelope & residual ====
         if self.env_combine_mode == "log":
@@ -530,7 +577,8 @@ class UnifiedReverbRAGModel(nn.Module):
             mag_pred = mag_env * mag_res
             log_pred = torch.log(mag_pred + 1e-3)
 
-        return log_pred, log_env
+        # log_env returned for potential extra losses (usually per-RIR in full mode)
+        return log_pred, self.debug_outputs.get("log_env_full", None)
 
 
     # --------------------------------------------------

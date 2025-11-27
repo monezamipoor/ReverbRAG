@@ -50,6 +50,7 @@ def build_train_loader(cfg, dataset):
     loss_cfg = cfg.get("losses", {}) or {}
     edc_w     = float(loss_cfg.get("edc", 0.0))
     env_rms_w = float(loss_cfg.get("env_rms", 0.0))
+    # envelope_enabled = cfg["model"]["envelope"]["enabled"]
     shuffle      = bool(sc.get("shuffle", True))
     num_workers  = int(sc.get("num_workers", 0))
     use_persist  = num_workers > 0

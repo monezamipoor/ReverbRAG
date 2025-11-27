@@ -21,7 +21,7 @@ run:
     # EDC loss (forces full-STFT sampler when > 0)
     edc: 0.2             # 0.0 disables EDC
     # Envelope / residual regularization
-    env_rms: 0.0         # weight for global RMS envelope loss (log-domain, uses full STFT)
+    env_rms: 0.1         # weight for global RMS envelope loss (log-domain, uses full STFT)
     res_l2: 0.0          # L2 regularization on residual log-STFT
     # Global scale for the total loss (applied at the end)
     global_scale: 1.0e-3
@@ -53,8 +53,8 @@ databases:
 model:
 
   envelope:
-    enabled: false                # flip this off for ablations
-    hidden: [512, 256, 256, 128]  # 4-layer MLP
+    enabled: true                # flip this off for ablations
+    hidden: [1024,512,256,256]  # 4-layer MLP  1024,512,256,256    2048, 1024, 1024, 512
     act: lrelu                    # {relu | lrelu | gelu | silu}
     tanh_scale: 0.0               # scale for tanh-bounded log envelope
     n_frames: 60                  # expected T; matches EDC bins

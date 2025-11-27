@@ -140,6 +140,7 @@ class Trainer:
         self.w_mse = float(loss_cfg.get("mse", 0.0))  # extra log-mse
         # Envelope + residual regularization
         self.w_env_rms = float(loss_cfg.get("env_rms", 0.0))  # RMS envelope (log-domain, full STFT)
+        self.env_rms_loss_type = str(loss_cfg.get("env_rms_type", "l1"))  # {"l1","mse"}
         self.w_res_l2  = float(loss_cfg.get("res_l2", 0.0))   # L2 penalty on residual log-STFT
 
         # EDC weighting (support both new `losses.edc` and old `edc_loss`)
@@ -230,6 +231,7 @@ class Trainer:
         src  = batch["source_pos"].to(self.device).float()
         head = batch["orientation"].to(self.device).float()
         t_idx = self._make_t_idx(batch, self.device, mode_full)
+        
         B = mic.shape[0]
         vfeat = self.visual_feat_builder(batch, B).to(self.device).float()
 
@@ -250,48 +252,59 @@ class Trainer:
 
         return pred
 
-    def _env_rms_loss(self, pred_log: torch.Tensor, gt_log: torch.Tensor) -> torch.Tensor:
-        """
-        Global RMS envelope supervision on FULL STFTs.
+    def _env_rms_loss(
+            self,
+            pred_env_log: torch.Tensor,   # [B, T_env] from envelope head (log_env_full)
+            gt_log:       torch.Tensor,   # [B, C, F, T] or [B, 1, F, T] log-mag STFT
+            loss_type:    str = "l1",
+        ) -> torch.Tensor:
+            """
+            Global RMS envelope supervision on FULL STFTs.
+            """
 
-        Args:
-            pred_log: [B, C, F, T] or [B, 1, F, T] log-magnitude prediction
-            gt_log:   same shape as pred_log
+            assert gt_log.shape[-1] == 60, "env_rms expects full GT STFT with T=60 frames"
 
-        Returns:
-            scalar MSE loss between log RMS envelopes [B, T].
-        """
-        assert pred_log.shape[-1] == 60, "env_rms expects full STFT with T=60 frames"
+            # compute GT log-RMS envelope from STFT (all in log domain at the end)
+            with torch.cuda.amp.autocast(enabled=False):
+                gt_log32 = gt_log.float()
 
-        # no AMP weirdness inside this calculation
-        with torch.cuda.amp.autocast(enabled=False):
-            pred_log32 = pred_log.float()
-            gt_log32   = gt_log.float()
+                mag_gt = (gt_log32.exp() - 1e-3).clamp_min(0.0)   # [B,C,F,T]
 
-            # ensure [B, C, F, T]
-            if pred_log32.dim() == 3:
-                pred_log32 = pred_log32.unsqueeze(1)
-                gt_log32   = gt_log32.unsqueeze(1)
+                E_gt = (mag_gt ** 2).sum(dim=-2)                  # sum over F → [B,C,T] or [B,T]
 
-            # convert to magnitude
-            mag_pred = (pred_log32.exp() - 1e-3).clamp_min(0.0)   # [B,C,F,T]
-            mag_gt   = (gt_log32.exp()   - 1e-3).clamp_min(0.0)
+                if E_gt.dim() == 3:
+                    E_gt = E_gt.mean(dim=1)                      # average channels → [B,T]
 
-            # energy over freq, then average over channels -> [B, T]
-            E_pred = (mag_pred ** 2).sum(dim=-2)   # [B,C,T]
-            E_gt   = (mag_gt   ** 2).sum(dim=-2)
+                rms_gt     = torch.sqrt(E_gt + 1e-8)              # [B,T]
+                log_rms_gt = torch.log(rms_gt + 1e-6)             # [B,T]
 
-            if E_pred.dim() == 3:
-                E_pred = E_pred.mean(dim=-3)       # [B,T]
-                E_gt   = E_gt.mean(dim=-3)
+            # enforce exact time AND batch alignment
+            B_pred, T_env = pred_env_log.shape
+            B_gt,   T_gt  = log_rms_gt.shape
 
-            rms_pred = torch.sqrt(E_pred + 1e-8)   # [B,T]
-            rms_gt   = torch.sqrt(E_gt   + 1e-8)
+            if T_gt != T_env:
+                raise RuntimeError(
+                    f"env_rms loss: time length mismatch between pred_env_log (T_env={T_env}) "
+                    f"and GT log-RMS envelope (T={T_gt}). "
+                    "Fix the envelope head output length or the GT envelope computation; "
+                    "no implicit interpolation is performed."
+                )
 
-            log_rms_pred = torch.log(rms_pred + 1e-6)
-            log_rms_gt   = torch.log(rms_gt   + 1e-6)
+            if B_pred != B_gt:
+                raise RuntimeError(
+                    f"env_rms loss: batch mismatch between pred_env_log (B={B_pred}) "
+                    f"and GT log-RMS envelope (B={B_gt}). "
+                    "You probably passed per-slice envelopes instead of per-RIR envelopes, "
+                    "or your STFT batch size doesn't match geometry batch size."
+                )
 
-            return F.mse_loss(log_rms_pred, log_rms_gt)
+            if loss_type == "mse":
+                return F.mse_loss(pred_env_log, log_rms_gt)
+            elif loss_type == "l1":
+                return F.l1_loss(pred_env_log, log_rms_gt)
+            else:
+                raise ValueError(f"Unknown env_rms loss_type='{loss_type}'")
+
 
 
     # ---- compact EDC loss (computed on full STFT batches only) ----
@@ -571,18 +584,70 @@ class Trainer:
                                     edc_val = edc_term.detach()
 
                                 # Envelope RMS term (optional)
+                                # Envelope RMS term (optional)
                                 if self.w_env_rms > 0.0:
-                                    env_term = self._env_rms_loss(pred_full, gt_full)
+                                    dbg = getattr(self.model, "debug_outputs", None)
+                                    log_env_full = None
+                                    if isinstance(dbg, dict):
+                                        log_env_full = dbg.get("log_env_full", None)
+
+                                    if log_env_full is None:
+                                        raise RuntimeError(
+                                            "env_rms > 0 requires model.debug_outputs['log_env_full'] "
+                                            "to be populated by the envelope head."
+                                        )
+
+                                    if log_env_full.dim() != 2:
+                                        raise RuntimeError(
+                                            f"env_rms expects log_env_full to be 2D [B, T_env], "
+                                            f"got shape {tuple(log_env_full.shape)}."
+                                        )
+
+                                    B_env, T_env = log_env_full.shape
+                                    B_full       = gt_full.shape[0]   # number of RIRs in this batch
+
+                                    # Case 1: model already gives one envelope per RIR → [B_full, T_env]
+                                    if B_env == B_full:
+                                        pred_env_for_loss = log_env_full
+
+                                    # Case 2: slice-mode output: one envelope per SLICE → [B_full * T, T_env]
+                                    elif (B_env % B_full) == 0:
+                                        T_frames = T  # max_frames from dataset, used above for _pack_slices_to_full
+                                        expected = B_full * T_frames
+                                        if B_env != expected:
+                                            raise RuntimeError(
+                                                "env_rms: envelope batch size does not match [B_full * T_frames]. "
+                                                f"Got B_env={B_env}, expected {expected} (B_full={B_full}, T_frames={T_frames})."
+                                            )
+
+                                        # reshape [B_full * T, T_env] -> [B_full, T, T_env]
+                                        env_reshaped = log_env_full.view(B_full, T_frames, T_env)
+
+                                        # Aggregate per-slice envelopes into a single envelope per RIR.
+                                        # You can also use .mean(dim=1) or [:,0,:]; mean is safer.
+                                        pred_env_for_loss = env_reshaped.mean(dim=1)   # [B_full, T_env]
+
+                                    else:
+                                        raise RuntimeError(
+                                            "env_rms: mismatch between envelope batch (B_env="
+                                            f"{B_env}) and full STFT batch (B_full={B_full}). "
+                                            "Expected either per-RIR [B_full, T_env] or per-slice "
+                                            "[B_full * T_frames, T_env] with contiguous slices per RIR."
+                                        )
+
+                                    env_term = self._env_rms_loss(
+                                        pred_env_for_loss, gt_full, loss_type=self.env_rms_loss_type
+                                    )
                                     parts["env_rms"] = env_term
                                     total = total + self.w_env_rms * env_term
+
                             else:
                                 # batch not divisible by T -> cannot pack full RIRs
-                                msg = "[warn] cannot pack slices (batch not multiple of T)."
-                                if self.w_env_rms > 0.0:
-                                    raise RuntimeError(msg + " env_rms requires full RIRs per batch.")
-                                if self.lambda_edc > 0.0 and not getattr(self, "_warned_slice_edc", False):
-                                    print(msg + " Skipping EDC term this step.")
-                                    self._warned_slice_edc = True
+                                if (self.w_env_rms > 0.0) or (self.lambda_edc > 0.0):
+                                    raise RuntimeError(
+                                        "[warn] cannot pack slices (batch not multiple of T)."
+                                        + " EDC/env_rms require full RIRs per batch when using slice mode."
+                                    )
                     else:
                         # full batches: pred and gt already [B, C, F, T]
                         if self.lambda_edc > 0.0:
@@ -591,7 +656,20 @@ class Trainer:
                             edc_val = edc_term.detach()
 
                         if self.w_env_rms > 0.0:
-                            env_term = self._env_rms_loss(pred, gt)
+                            dbg = getattr(self.model, "debug_outputs", None)
+                            log_env_full = None
+                            if isinstance(dbg, dict):
+                                log_env_full = dbg.get("log_env_full", None)
+
+                            if log_env_full is None:
+                                raise RuntimeError(
+                                    "env_rms > 0 requires model.debug_outputs['log_env_full'] "
+                                    "to be populated by the envelope head."
+                                )
+
+                            env_term = self._env_rms_loss(
+                                log_env_full, gt, loss_type=self.env_rms_loss_type
+                            )
                             parts["env_rms"] = env_term
                             total = total + self.w_env_rms * env_term
                             

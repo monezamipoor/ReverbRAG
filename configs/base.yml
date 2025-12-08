@@ -54,11 +54,11 @@ model:
 
   envelope:
     enabled: true                # flip this off for ablations
-    hidden: [1024,512,256,256]  # 4-layer MLP  1024,512,256,256    2048, 1024, 1024, 512
+    hidden: [2048, 1024, 1024, 512]  # 4-layer MLP  1024,512,256,256    2048, 1024, 1024, 512
     act: lrelu                    # {relu | lrelu | gelu | silu}
     tanh_scale: 0.0               # scale for tanh-bounded log envelope
     n_frames: 60                  # expected T; matches EDC bins
-    normalize: false               # normalize residual STFT mags
+    normalize: true               # normalize residual STFT mags
     combine_mode: "log"           # or "log" how to combine envelope + detail
 
   reverbrag:

@@ -225,23 +225,19 @@ class RAFDataset(Dataset):
 
     # -------- Fast-path memmap fetchers (no cache) --------
     def _mm_fetch_stft(self, sid: str) -> torch.Tensor:
-        ptr = getattr(self, "_sid_ptr", None)
+        if not self.return_complex_stft:
+            ptr = getattr(self, "_sid_ptr", None)
+            if ptr is not None:
+                k, row = ptr[sid]
+                a = self._st_shards[k][row]
+                x = torch.from_numpy(a.astype(np.float32))
+                return x.unsqueeze(0)  # [1, F, 60]
+            wav = self._load_wav(sid)
+            return self._stft_full(wav)  # existing log-mag path
 
-        if ptr is not None and not self.return_complex_stft:
-            # existing fast-path log-magnitude memmap
-            k, row = ptr[sid]
-            a = self._st_shards[k][row]
-            x = torch.from_numpy(a.astype(np.float32))
-            return x.unsqueeze(0)   # [1,F,60]
-
-        # FALL BACK TO ONLINE COMPUTE
+        # complex path → recompute (no memmap)
         wav = self._load_wav(sid)
-
-        if self.return_complex_stft:
-            return self._compute_complex_stft(wav)  # [1,F,T], complex
-
-        # Default = log-mag
-        return self._stft_full(wav)
+        return self._compute_complex_stft(wav)  # [1, F, 60] complex
 
 
     def _mm_fetch_edc(self, sid: str) -> torch.Tensor:
@@ -304,10 +300,7 @@ class RAFDataset(Dataset):
             sid = self.ids[index]
             rx, tx, orientation = self._load_positions_and_ori(sid)
             wav_full = self._load_wav(sid)
-            if self.return_complex_stft:
-                stft_full = self._compute_complex_stft(wav_full)
-            else:
-                stft_full = self._mm_fetch_stft(sid)
+            stft_full = self._mm_fetch_stft(sid)
             frgb, fdep = self._av_feats(sid)
             out = {
                 "id": sid,
@@ -324,10 +317,7 @@ class RAFDataset(Dataset):
             sid = self.ids[sid_idx]
             rx, tx, orientation = self._load_positions_and_ori(sid)
             wav_full = self._load_wav(sid)
-            if self.return_complex_stft:
-                stft_full = self._compute_complex_stft(wav_full)
-            else:
-                stft_full = self._mm_fetch_stft(sid)
+            stft_full = self._mm_fetch_stft(sid)
             frgb, fdep = self._av_feats(sid)
             out = {
                 "id": sid,

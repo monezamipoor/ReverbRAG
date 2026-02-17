@@ -52,6 +52,13 @@ databases:
 
 model:
 
+  temporal_attention:
+    enabled: false        # when true, force sequence-style training batches
+    causal: true          # each frame attends only to <= current frame
+    n_layers: 2
+    n_heads: 8
+    dropout: 0.1
+
   envelope:
     enabled: false                # flip this off for ablations
     hidden: [2048, 1024, 1024, 512]  # 4-layer MLP  1024,512,256,256    2048, 1024, 1024, 512

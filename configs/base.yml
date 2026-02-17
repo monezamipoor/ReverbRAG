@@ -53,7 +53,7 @@ databases:
 model:
 
   temporal_attention:
-    enabled: true        # when true, force sequence-style training batches
+    enabled: false        # when true, force sequence-style training batches
     causal: true          # each frame attends only to <= current frame
     n_layers: 2
     n_heads: 8
@@ -91,4 +91,4 @@ model:
   decoder:
     # empty list = single Linear(W, N_freq) per channel (old behaviour)
     # e.g. [2048, 1024] would give W -> 2048 -> 1024 -> N_freq
-    hidden: [1024, 1024]
+    hidden: []

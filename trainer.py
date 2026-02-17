@@ -60,6 +60,7 @@ class Trainer:
     - eval(): forces dataset_mode='full' (we need all T to compute metrics).
     - save_model(): checkpoint helper.
     """
+    
     def __init__(
         self,
         model: nn.Module,
@@ -441,6 +442,39 @@ class Trainer:
             .squeeze(-1)                                     # [B,C,F,T]
             .contiguous()
         )
+        
+    @staticmethod
+    def _pack_grouped_slice_batch(batch: Dict[str, torch.Tensor], T: int) -> Dict[str, torch.Tensor]:
+        """
+        Convert grouped slice batch (B_slices = B_rir*T) into full-sequence batch for model forward.
+        Assumes EDCFullBatchSampler ordering: contiguous T slices per RIR, in time order.
+        """
+        B_s = batch["receiver_pos"].shape[0]
+        if (B_s % T) != 0:
+            raise RuntimeError(f"Cannot pack grouped slices: B_s={B_s} not divisible by T={T}")
+        B = B_s // T
+
+        def _first_per_rir(x: torch.Tensor) -> torch.Tensor:
+            return x.view(B, T, *x.shape[1:])[:, 0, ...]
+
+        st = batch["stft_slice"]  # [B_s, 1, F]
+        st_full = st.view(B, T, st.shape[1], st.shape[2]).permute(0, 2, 3, 1).contiguous()  # [B,1,F,T]
+
+        out = {
+            "receiver_pos": _first_per_rir(batch["receiver_pos"]),
+            "source_pos": _first_per_rir(batch["source_pos"]),
+            "orientation": _first_per_rir(batch["orientation"]),
+            "stft": st_full,
+        }
+
+        if "feat_rgb" in batch:
+            out["feat_rgb"] = _first_per_rir(batch["feat_rgb"])
+        if "feat_depth" in batch:
+            out["feat_depth"] = _first_per_rir(batch["feat_depth"])
+        if "ref_indices" in batch:
+            out["ref_indices"] = _first_per_rir(batch["ref_indices"])
+
+        return out
 
     def save_model(self, path: str, extra: Optional[Dict[str, Any]] = None):
         state = {
@@ -544,11 +578,24 @@ class Trainer:
             for batch in train_loader:
                 # infer mode: slice batches carry 'stft_slice'
                 is_slice = ("stft_slice" in batch)
-                gt = (batch["stft_slice"] if is_slice else batch["stft"]).to(self.device).float()
-                if is_slice:
-                    gt = gt.unsqueeze(-1)  # [B*T, 1, F, 1]
+                bs_obj = getattr(train_loader, "batch_sampler", None)
+                sampler_name = type(bs_obj).__name__ if bs_obj is not None else type(train_loader.sampler).__name__
+                temporal_on = bool(getattr(self.model, "use_temporal_attention", False))
 
-                pred = self._forward_batch(batch, mode_full=not is_slice)
+                if is_slice and temporal_on:
+                    if sampler_name != "EDCFullBatchSampler":
+                        raise RuntimeError("temporal_attention requires EDCFullBatchSampler (grouped contiguous slices).")
+                    T = int(getattr(train_loader.dataset, "max_frames", 60))
+                    fwd_batch = self._pack_grouped_slice_batch(batch, T=T)
+
+                    gt = fwd_batch["stft"].to(self.device).float()         # [B_rir,1,F,T]
+                    pred = self._forward_batch(fwd_batch, mode_full=True)  # [B_rir,C,F,T]
+                    is_slice = False  # downstream loss code should treat this as full-mode
+                else:
+                    gt = (batch["stft_slice"] if is_slice else batch["stft"]).to(self.device).float()
+                    if is_slice:
+                        gt = gt.unsqueeze(-1)  # [B_slices, 1, F, 1]
+                    pred = self._forward_batch(batch, mode_full=not is_slice)
 
                 # spectral loss (pass a string or bool to keep API simple)
                 total, parts, edc_val = self._loss(pred, gt)
@@ -651,7 +698,7 @@ class Trainer:
                     else:
                         # full batches: pred and gt already [B, C, F, T]
                         if self.lambda_edc > 0.0:
-                            edc_term = self._edc_loss(pred, gt, valid_mask=None, p=1)
+                            edc_term = self._edc_loss(pred, gt, valid_mask=None)
                             total = total + self.lambda_edc * edc_term
                             edc_val = edc_term.detach()
 

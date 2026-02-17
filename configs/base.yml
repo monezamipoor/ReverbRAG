@@ -53,7 +53,7 @@ databases:
 model:
 
   temporal_attention:
-    enabled: false        # when true, force sequence-style training batches
+    enabled: true        # when true, force sequence-style training batches
     causal: true          # each frame attends only to <= current frame
     n_layers: 2
     n_heads: 8

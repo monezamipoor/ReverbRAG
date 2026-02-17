@@ -331,6 +331,56 @@ class GlobalEnvelopeHead(nn.Module):
         return log_env
 
 # ----------------------------
+# Temporal attention layer
+# ----------------------------
+
+class TemporalCausalBlock(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1, ff_mult: int = 4):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=n_heads, dropout=dropout, batch_first=True
+        )
+        self.drop1 = nn.Dropout(dropout)
+
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, ff_mult * d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_mult * d_model, d_model),
+        )
+        self.drop2 = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, causal_mask: torch.Tensor) -> torch.Tensor:
+        h = self.norm1(x)
+        a, _ = self.attn(h, h, h, attn_mask=causal_mask, need_weights=False)
+        x = x + self.drop1(a)
+        x = x + self.drop2(self.ff(self.norm2(x)))
+        return x
+
+
+class TemporalCausalStack(nn.Module):
+    def __init__(self, d_model: int, n_layers: int, n_heads: int, dropout: float = 0.1, ff_mult: int = 4):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            TemporalCausalBlock(d_model=d_model, n_heads=n_heads, dropout=dropout, ff_mult=ff_mult)
+            for _ in range(n_layers)
+        ])
+
+    @staticmethod
+    def _causal_mask(T: int, device: torch.device) -> torch.Tensor:
+        # True entries are blocked in MultiheadAttention
+        return torch.triu(torch.ones(T, T, device=device, dtype=torch.bool), diagonal=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        T = x.shape[1]
+        mask = self._causal_mask(T, x.device)
+        for blk in self.blocks:
+            x = blk(x, mask)
+        return x
+
+# ----------------------------
 # Unified ReverbRAG NVAS Model
 # ----------------------------
 class UnifiedReverbRAGModel(nn.Module):
@@ -405,6 +455,26 @@ class UnifiedReverbRAGModel(nn.Module):
             self.rag_gen = None
 
         self.token_norm = nn.LayerNorm(cfg.W_field)
+        
+        # ---- Temporal attention (optional) ----
+        ta_cfg = cfg.opt.get("temporal_attention", {}) or {}
+        self.use_temporal_attention = bool(ta_cfg.get("enabled", False))
+        self.temporal_causal = bool(ta_cfg.get("causal", True))
+        ta_layers = int(ta_cfg.get("n_layers", 2))
+        ta_heads = int(ta_cfg.get("n_heads", 8))
+        ta_dropout = float(ta_cfg.get("dropout", 0.1))
+        ta_ff_mult = int(ta_cfg.get("ff_mult", 4))
+
+        if self.use_temporal_attention:
+            self.temporal_stack = TemporalCausalStack(
+                d_model=cfg.W_field,
+                n_layers=ta_layers,
+                n_heads=ta_heads,
+                dropout=ta_dropout,
+                ff_mult=ta_ff_mult,
+            )
+        else:
+            self.temporal_stack = None
 
         # ---- Envelope head ----
         env_cfg = cfg.opt.get("envelope", {}) or {}
@@ -612,6 +682,11 @@ class UnifiedReverbRAGModel(nn.Module):
         # ---- encoder: tokens from (c, t) ----
         w = self.encoder(c, t_idx, aux=aux)                  # [B, T, W]
         w = self.token_norm(w)
+        
+        # ---- temporal causal attention (optional) ----
+        if self.use_temporal_attention:
+            # requires sequence-shaped forward (T > 1 to be meaningful)
+            w = self.temporal_stack(w)
 
         # ---- RAG pre-fusion (film / concat) ----
         if self.use_rag and self.fusion in ("film", "concat"):

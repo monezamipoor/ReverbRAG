@@ -352,7 +352,7 @@ class TemporalCausalBlock(nn.Module):
         )
         self.drop2 = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, causal_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, causal_mask: Optional[torch.Tensor]) -> torch.Tensor:
         h = self.norm1(x)
         a, _ = self.attn(h, h, h, attn_mask=causal_mask, need_weights=False)
         x = x + self.drop1(a)
@@ -361,8 +361,17 @@ class TemporalCausalBlock(nn.Module):
 
 
 class TemporalCausalStack(nn.Module):
-    def __init__(self, d_model: int, n_layers: int, n_heads: int, dropout: float = 0.1, ff_mult: int = 4):
+    def __init__(
+        self,
+        d_model: int,
+        n_layers: int,
+        n_heads: int,
+        dropout: float = 0.1,
+        ff_mult: int = 4,
+        causal: bool = True,
+    ):
         super().__init__()
+        self.causal = bool(causal)
         self.blocks = nn.ModuleList([
             TemporalCausalBlock(d_model=d_model, n_heads=n_heads, dropout=dropout, ff_mult=ff_mult)
             for _ in range(n_layers)
@@ -375,7 +384,7 @@ class TemporalCausalStack(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         T = x.shape[1]
-        mask = self._causal_mask(T, x.device)
+        mask = self._causal_mask(T, x.device) if self.causal else None
         for blk in self.blocks:
             x = blk(x, mask)
         return x
@@ -472,6 +481,7 @@ class UnifiedReverbRAGModel(nn.Module):
                 n_heads=ta_heads,
                 dropout=ta_dropout,
                 ff_mult=ta_ff_mult,
+                causal=self.temporal_causal,
             )
         else:
             self.temporal_stack = None

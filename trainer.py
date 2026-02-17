@@ -454,6 +454,15 @@ class Trainer:
             raise RuntimeError(f"Cannot pack grouped slices: B_s={B_s} not divisible by T={T}")
         B = B_s // T
 
+        if "slice_t" in batch:
+            slice_t = batch["slice_t"].view(B, T)
+            expected = torch.arange(T, device=slice_t.device).view(1, T).expand(B, T)
+            if not torch.equal(slice_t.long(), expected.long()):
+                raise RuntimeError(
+                    "Grouped slice batch is not time-ordered per RIR. "
+                    "temporal_attention requires contiguous slice_t = [0..T-1] within each group."
+                )
+
         def _first_per_rir(x: torch.Tensor) -> torch.Tensor:
             return x.view(B, T, *x.shape[1:])[:, 0, ...]
 

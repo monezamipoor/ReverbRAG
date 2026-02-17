@@ -91,4 +91,4 @@ model:
   decoder:
     # empty list = single Linear(W, N_freq) per channel (old behaviour)
     # e.g. [2048, 1024] would give W -> 2048 -> 1024 -> N_freq
-    hidden: []
+    hidden: [1024, 1024]

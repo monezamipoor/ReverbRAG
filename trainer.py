@@ -80,11 +80,15 @@ class Trainer:
         self.log_every = int(run_cfg.get("log_every", 50))
         # STFT/ISTFT & Evaluator (parameters taken “from main.py”)
         fs = int(run_cfg.get("sample_rate", 48000))
+        self.fs = fs
         stftp = stft_params or fs_to_stft_params(fs)
+        self._base_n_fft = int((stftp["N_freq"] - 1) * 2)
+        self._base_win_length = int(stftp["win_len"])
+        self._base_hop_length = int(stftp["hop_len"])
         self.istft = GriffinLim(
-            n_fft=(stftp["N_freq"] - 1) * 2,
-            win_length=stftp["win_len"],
-            hop_length=stftp["hop_len"],
+            n_fft=self._base_n_fft,
+            win_length=self._base_win_length,
+            hop_length=self._base_hop_length,
             power=1,
         ).to(device=device, dtype=torch.float32)
         self.evaluator = UnifiedEvaluator(fs=fs, edc_bins=60, edc_dist="l1")
@@ -154,6 +158,39 @@ class Trainer:
         self.tw_apply_to_mag = bool(tw_cfg.get("apply_to_mag", True))
         self.tw_apply_to_mse = bool(tw_cfg.get("apply_to_mse", True))
         self.tw_max_frames = int(tw_cfg.get("max_frames", 60))
+
+        # Optional multi-resolution STFT waveform loss (using GT phase for ISTFT).
+        mr_cfg = loss_cfg.get("mrstft", {}) or {}
+        self.mrstft_enabled = bool(mr_cfg.get("enabled", False))
+        self.mrstft_weight = float(mr_cfg.get("weight", 0.0))
+        self.mrstft_loss_type = str(mr_cfg.get("loss_type", "l1")).lower()
+        self.mrstft_freq_focus = str(mr_cfg.get("freq_focus", "none")).lower()
+        self.mrstft_low_hz = float(mr_cfg.get("low_hz", 300.0))
+        self._warned_mrstft_skip = False
+        self.mrstft_scales = []
+        self._mr_windows = []
+        if self.mrstft_enabled and self.mrstft_weight > 0.0:
+            scales = mr_cfg.get("scales", None)
+            if not scales:
+                scales = [
+                    {"n_fft": 512,  "win_length": 256,  "hop_length": 128, "w": 1.0},
+                    {"n_fft": 1024, "win_length": 512,  "hop_length": 256, "w": 1.0},
+                    {"n_fft": 2048, "win_length": 1024, "hop_length": 512, "w": 1.2},
+                ]
+            for s in scales:
+                n_fft = int(s["n_fft"])
+                win_length = int(s.get("win_length", n_fft // 2))
+                hop_length = int(s.get("hop_length", max(1, win_length // 2)))
+                w = float(s.get("w", 1.0))
+                if win_length > n_fft:
+                    raise ValueError(f"mrstft scale invalid: win_length({win_length}) > n_fft({n_fft})")
+                self.mrstft_scales.append({
+                    "n_fft": n_fft,
+                    "win_length": win_length,
+                    "hop_length": hop_length,
+                    "w": w,
+                })
+                self._mr_windows.append(torch.hann_window(win_length, device=self.device, dtype=torch.float32))
 
         # EDC weighting (support both new `losses.edc` and old `edc_loss`)
         self.lambda_edc = float(
@@ -514,6 +551,133 @@ class Trainer:
         # If you set all weights to 0.0, total == 0 and you’ve soft-bricked training.
         return total, parts, None
 
+    @staticmethod
+    def _match_stft_timebins(x: torch.Tensor, T_target: int) -> torch.Tensor:
+        """
+        Match complex STFT time bins to target T by crop or repeat-last-frame pad.
+        x: [B,C,F,T_cur] complex
+        """
+        T_cur = int(x.shape[-1])
+        if T_cur == T_target:
+            return x
+        if T_cur > T_target:
+            return x[..., :T_target]
+        pad = T_target - T_cur
+        last = x[..., -1:].expand(*x.shape[:-1], pad)
+        return torch.cat([x, last], dim=-1)
+
+    def _reconstruct_wav_with_gt_phase(self, pred_log: torch.Tensor, gt_wav: torch.Tensor) -> torch.Tensor:
+        """
+        Reconstruct waveform from predicted log-mag using GT phase at base STFT params.
+        pred_log: [B,C,F,T]
+        gt_wav:   [B,Cg,Tw] (Cg may be 1)
+        returns:  [B,C,Tw]
+        """
+        pred_log = pred_log.float()
+        gt_wav = gt_wav.float()
+        B, C, F, T = pred_log.shape
+        B_w, Cg, Tw = gt_wav.shape
+        if B_w != B:
+            raise RuntimeError(f"mrstft: batch mismatch pred(B={B}) vs gt_wav(B={B_w}).")
+
+        # If GT wav has one channel but prediction has more, share phase across channels.
+        if Cg == 1 and C > 1:
+            gt_wav = gt_wav.expand(B, C, Tw)
+            Cg = C
+        if Cg != C:
+            raise RuntimeError(f"mrstft: channel mismatch pred(C={C}) vs gt_wav(C={Cg}).")
+
+        gt_flat = gt_wav.reshape(B * C, Tw)
+        base_window = torch.hann_window(self._base_win_length, device=gt_wav.device, dtype=gt_wav.dtype)
+        gt_c = torch.stft(
+            gt_flat,
+            n_fft=self._base_n_fft,
+            hop_length=self._base_hop_length,
+            win_length=self._base_win_length,
+            window=base_window,
+            center=True,
+            return_complex=True,
+        )  # [B*C,F,Tc]
+        gt_c = gt_c.view(B, C, gt_c.shape[-2], gt_c.shape[-1])
+        gt_c = self._match_stft_timebins(gt_c, T_target=T)
+        if gt_c.shape[-2] != F:
+            raise RuntimeError(f"mrstft: freq mismatch pred(F={F}) vs gt_phase(F={gt_c.shape[-2]}).")
+
+        phase_unit = gt_c / gt_c.abs().clamp_min(1e-8)
+        pred_mag = (pred_log.exp() - 1e-3).clamp_min(0.0)
+        pred_c = pred_mag.to(phase_unit.dtype) * phase_unit
+
+        pred_c_flat = pred_c.reshape(B * C, F, T)
+        wav_pred_flat = torch.istft(
+            pred_c_flat,
+            n_fft=self._base_n_fft,
+            hop_length=self._base_hop_length,
+            win_length=self._base_win_length,
+            window=base_window,
+            center=True,
+            length=Tw,
+        )  # [B*C,Tw]
+        return wav_pred_flat.view(B, C, Tw)
+
+    def _mrstft_loss(self, wav_pred: torch.Tensor, wav_gt: torch.Tensor) -> torch.Tensor:
+        """
+        Multi-resolution STFT loss on waveforms.
+        wav_pred, wav_gt: [B,C,Tw]
+        """
+        if wav_pred.shape != wav_gt.shape:
+            raise RuntimeError(f"mrstft: wav shape mismatch {tuple(wav_pred.shape)} vs {tuple(wav_gt.shape)}")
+
+        B, C, Tw = wav_pred.shape
+        wp = wav_pred.reshape(B * C, Tw).float()
+        wg = wav_gt.reshape(B * C, Tw).float()
+
+        total = wp.new_zeros(())
+        wsum = 0.0
+        for sc, win in zip(self.mrstft_scales, self._mr_windows):
+            Xp = torch.stft(
+                wp,
+                n_fft=sc["n_fft"],
+                hop_length=sc["hop_length"],
+                win_length=sc["win_length"],
+                window=win,
+                center=True,
+                return_complex=True,
+            )
+            Xg = torch.stft(
+                wg,
+                n_fft=sc["n_fft"],
+                hop_length=sc["hop_length"],
+                win_length=sc["win_length"],
+                window=win,
+                center=True,
+                return_complex=True,
+            )
+
+            mp = Xp.abs().clamp_min(1e-8)
+            mg = Xg.abs().clamp_min(1e-8)
+            lp = torch.log(mp + 1e-6)
+            lg = torch.log(mg + 1e-6)
+            err = (lp - lg).abs() if self.mrstft_loss_type == "l1" else (lp - lg).pow(2)
+
+            if self.mrstft_freq_focus == "low":
+                n_freq = int(mp.shape[-2])
+                freqs = torch.linspace(
+                    0.0, self.fs / 2.0, steps=n_freq, device=err.device, dtype=err.dtype
+                )
+                mask = (freqs <= self.mrstft_low_hz).to(err.dtype).view(1, -1, 1)
+                # Keep baseline weight for all bins and emphasize low bins.
+                f_w = 1.0 + mask
+                err = err * f_w
+                err = err.sum() / f_w.expand_as(err).sum().clamp_min(1e-12)
+            else:
+                err = err.mean()
+
+            sw = float(sc["w"])
+            total = total + sw * err
+            wsum += sw
+
+        return total / max(wsum, 1e-12)
+
 
     @staticmethod
     def _format_parts(parts_dict, edc_val):
@@ -726,6 +890,34 @@ class Trainer:
                 total, parts, edc_val = self._loss(
                     pred, gt, slice_t=slice_t_for_loss, is_slice=is_slice
                 )
+
+                # Optional multi-resolution STFT waveform loss (GT-phase reconstruction).
+                if self.mrstft_enabled and self.mrstft_weight > 0.0:
+                    bs_obj = getattr(train_loader, "batch_sampler", None)
+                    sampler_name = type(bs_obj).__name__ if bs_obj is not None else type(train_loader.sampler).__name__
+                    if is_slice:
+                        T = int(getattr(train_loader.dataset, "max_frames", 60))
+                        if sampler_name == "EDCFullBatchSampler" and (pred.shape[0] % T) == 0:
+                            B_full = pred.shape[0] // T
+                            pred_full = self._pack_slices_to_full(pred, T)  # [B,C,F,T]
+                            wav = batch["wav"].to(self.device).float()       # [B*T,1,Tw]
+                            wav = wav.view(B_full, T, wav.shape[1], wav.shape[2])[:, 0, ...]  # [B,1,Tw]
+                        else:
+                            if not self._warned_mrstft_skip:
+                                print("[warn] mrstft enabled but skipping this step (slice batch cannot be packed to full RIRs).")
+                                self._warned_mrstft_skip = True
+                            pred_full = None
+                            wav = None
+                    else:
+                        pred_full = pred
+                        wav = batch["wav"].to(self.device).float()  # [B,1,Tw] on RAF
+
+                    if pred_full is not None and wav is not None:
+                        wav_pred = self._reconstruct_wav_with_gt_phase(pred_full, wav)
+                        wav_gt = wav.expand_as(wav_pred) if (wav.shape[1] == 1 and wav_pred.shape[1] > 1) else wav
+                        mr_term = self._mrstft_loss(wav_pred, wav_gt)
+                        parts["mrstft"] = mr_term
+                        total = total + self.mrstft_weight * mr_term
 
                 # inside train() loop, after total, parts, edc_val = self._loss(...)
                 # EDC and/or global envelope RMS both need full STFTs

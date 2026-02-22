@@ -40,6 +40,17 @@ run:
       max_frames: 60
       apply_to_mag: true
       apply_to_mse: true
+    # Optional multi-resolution STFT loss computed on waveforms reconstructed with GT phase.
+    mrstft:
+      enabled: false
+      weight: 0.3
+      loss_type: l1          # {l1|mse} over log-magnitude STFTs
+      freq_focus: none       # {none|low}
+      low_hz: 300.0
+      scales:
+        - { n_fft: 512,  win_length: 256,  hop_length: 128,  w: 1.0 }  # shorter window (time detail)
+        - { n_fft: 1024, win_length: 512,  hop_length: 256,  w: 1.0 }  # baseline scale
+        - { n_fft: 2048, win_length: 1024, hop_length: 512,  w: 1.5 }  # longer window (freq detail)
     optimizer: avnerf    # {neraf | avnerf} selects which pred to use for loss
 
 renders:

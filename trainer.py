@@ -133,7 +133,8 @@ class Trainer:
 
         # NeRAF-style STFT loss (SC + log-mag)
         mag_loss_type = loss_cfg.get("mag_loss_type", "mse")  # { "l1", "mse" }
-        self.loss_fn = STFTLoss(loss_type=mag_loss_type)
+        self.mag_loss_type = str(mag_loss_type).lower()
+        self.loss_fn = STFTLoss(loss_type=self.mag_loss_type)
 
         # Weights for each term
         self.w_sc  = float(loss_cfg.get("sc", 0.0))   # spectral convergence
@@ -143,6 +144,16 @@ class Trainer:
         self.w_env_rms = float(loss_cfg.get("env_rms", 0.0))  # RMS envelope (log-domain, full STFT)
         self.env_rms_loss_type = str(loss_cfg.get("env_rms_type", "l1"))  # {"l1","mse"}
         self.w_res_l2  = float(loss_cfg.get("res_l2", 0.0))   # L2 penalty on residual log-STFT
+
+        # Optional early-time weighting for STFT losses (mag/mse only).
+        tw_cfg = loss_cfg.get("time_weight", {}) or {}
+        self.time_weight_enabled = bool(tw_cfg.get("enabled", False))
+        self.tw_early_frames = int(tw_cfg.get("early_frames", 12))
+        self.tw_early_gain = float(tw_cfg.get("early_gain", 2.0))
+        self.tw_normalize_mean = bool(tw_cfg.get("normalize_mean", True))
+        self.tw_apply_to_mag = bool(tw_cfg.get("apply_to_mag", True))
+        self.tw_apply_to_mse = bool(tw_cfg.get("apply_to_mse", True))
+        self.tw_max_frames = int(tw_cfg.get("max_frames", 60))
 
         # EDC weighting (support both new `losses.edc` and old `edc_loss`)
         self.lambda_edc = float(
@@ -407,26 +418,86 @@ class Trainer:
             return per_b.mean()
         
 
-    def _loss(self, pred_log, gt_log):
+    def _make_time_weights(self, T: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Build per-frame weights [T], boosting the first tw_early_frames."""
+        w = torch.ones(T, device=device, dtype=dtype)
+        if T <= 0:
+            return w
+        ef = max(0, min(int(self.tw_early_frames), int(T)))
+        if ef > 0 and self.tw_early_gain != 1.0:
+            w[:ef] = float(self.tw_early_gain)
+        if self.tw_normalize_mean:
+            w = w / w.mean().clamp_min(1e-12)
+        return w
+
+    @staticmethod
+    def _weighted_mean(err: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        """
+        Weighted mean over all dimensions of err.
+        err: [B,C,F,T], w broadcastable to err (e.g., [1,1,1,T] or [B,1,1,1]).
+        """
+        w_exp = w.expand_as(err)
+        return (err * w_exp).sum() / w_exp.sum().clamp_min(1e-12)
+
+    def _loss(self, pred_log, gt_log, slice_t: Optional[torch.Tensor] = None, is_slice: bool = False):
         pred_log = pred_log.float()
         gt_log   = gt_log.float()
 
         parts = {}
         total = 0.0
 
-        # ----- STFT-based losses (SC + log-mag) -----
-        if self.w_sc != 0.0 or self.w_mag != 0.0:
-            stft_parts = self.loss_fn(pred_log, gt_log)  # returns {"audio_sc_loss", "audio_mag_loss"}
-            parts.update(stft_parts)
+        time_w = None
+        if self.time_weight_enabled:
+            if is_slice:
+                if slice_t is None:
+                    raise RuntimeError("time_weight.enabled=True in slice mode but slice_t is missing.")
+                idx = slice_t.to(pred_log.device).long().view(-1)
+                base_w = self._make_time_weights(
+                    T=int(self.tw_max_frames),
+                    device=pred_log.device,
+                    dtype=pred_log.dtype,
+                )
+                idx = idx.clamp(0, base_w.shape[0] - 1)
+                # [B,1,1,1] to weight each slice-sample by its global time index.
+                time_w = base_w.index_select(0, idx).view(-1, 1, 1, 1)
+            else:
+                # [1,1,1,T] for full-sequence batches.
+                T_cur = int(pred_log.shape[-1])
+                time_w = self._make_time_weights(
+                    T=T_cur,
+                    device=pred_log.device,
+                    dtype=pred_log.dtype,
+                ).view(1, 1, 1, T_cur)
 
-            if self.w_sc != 0.0:
-                total = total + self.w_sc * stft_parts["audio_sc_loss"]
-            if self.w_mag != 0.0:
-                total = total + self.w_mag * stft_parts["audio_mag_loss"]
+        # ----- STFT-based losses -----
+        # Spectral convergence remains unweighted (global ratio over TF).
+        if self.w_sc != 0.0:
+            x_mag = torch.exp(pred_log) - 1e-3
+            y_mag = torch.exp(gt_log) - 1e-3
+            sc_val = self.loss_fn.sc(x_mag, y_mag)
+            parts["audio_sc_loss"] = sc_val
+            total = total + self.w_sc * sc_val
 
-        # ----- Extra log-MSE term (AV-NeRF-style) -----
+        # Log-magnitude (L1/MSE), optionally early-time weighted.
+        if self.w_mag != 0.0:
+            if self.mag_loss_type == "mse":
+                mag_err = (pred_log - gt_log).pow(2)
+            else:
+                mag_err = (pred_log - gt_log).abs()
+            if self.time_weight_enabled and self.tw_apply_to_mag:
+                mag_val = self._weighted_mean(mag_err, time_w)
+            else:
+                mag_val = mag_err.mean()
+            parts["audio_mag_loss"] = mag_val
+            total = total + self.w_mag * mag_val
+
+        # ----- Extra log-MSE term (AV-NeRF-style), optionally early-time weighted -----
         if self.w_mse != 0.0:
-            mse_val = F.mse_loss(pred_log, gt_log)
+            mse_err = (pred_log - gt_log).pow(2)
+            if self.time_weight_enabled and self.tw_apply_to_mse:
+                mse_val = self._weighted_mean(mse_err, time_w)
+            else:
+                mse_val = mse_err.mean()
             parts["mse"] = mse_val
             total = total + self.w_mse * mse_val
             
@@ -651,7 +722,10 @@ class Trainer:
                     pred = self._forward_batch(batch, mode_full=not is_slice)
 
                 # spectral loss (pass a string or bool to keep API simple)
-                total, parts, edc_val = self._loss(pred, gt)
+                slice_t_for_loss = batch.get("slice_t", None) if is_slice else None
+                total, parts, edc_val = self._loss(
+                    pred, gt, slice_t=slice_t_for_loss, is_slice=is_slice
+                )
 
                 # inside train() loop, after total, parts, edc_val = self._loss(...)
                 # EDC and/or global envelope RMS both need full STFTs

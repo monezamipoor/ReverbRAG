@@ -31,6 +31,15 @@ run:
     res_l2: 0.0          # L2 regularization on residual log-STFT
     # Global scale for the total loss (applied at the end)
     global_scale: 1.0e-3
+    # Optional early-time weighting for frame-local STFT losses.
+    time_weight:
+      enabled: false
+      early_frames: 12      # first N frames to boost (12 * 5ms ~= 60ms)
+      early_gain: 2.0       # multiplier on early frames
+      normalize_mean: true  # keep mean weight ~1
+      max_frames: 60
+      apply_to_mag: true
+      apply_to_mse: true
     optimizer: avnerf    # {neraf | avnerf} selects which pred to use for loss
 
 renders:
@@ -59,7 +68,7 @@ databases:
 model:
 
   temporal_attention:
-    enabled: true        # when true, force sequence-style training batches
+    enabled: false        # when true, force sequence-style training batches
     causal: true          # each frame attends only to <= current frame
     n_layers: 2
     n_heads: 8
@@ -97,4 +106,4 @@ model:
   decoder:
     # empty list = single Linear(W, N_freq) per channel (old behaviour)
     # e.g. [2048, 1024] would give W -> 2048 -> 1024 -> N_freq
-    hidden: [1024, 1024]
+    hidden: []

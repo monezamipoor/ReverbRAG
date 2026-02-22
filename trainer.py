@@ -160,21 +160,59 @@ class Trainer:
             loss_cfg.get("global_scale", run_cfg.get("loss_factor", 1e-3))
         )
 
+        # Gradient clipping
+        grad_clip_cfg = run_cfg.get("grad_clip", {}) or {}
+        self.grad_clip_enabled = bool(grad_clip_cfg.get("enabled", False))
+        self.grad_clip_max_norm = float(grad_clip_cfg.get("max_norm", 1.0))
+        self.grad_clip_norm_type = float(grad_clip_cfg.get("norm_type", 2.0))
+
+        # Optional LR multiplier for temporal attention params
+        self.temporal_lr_mult = float(run_cfg.get("temporal_attention_lr_mult", 1.0))
+
+        # Build optimizer param groups (temporal stack can use a lower LR)
+        temporal_module = getattr(self.model, "temporal_stack", None)
+        temporal_on = bool(getattr(self.model, "use_temporal_attention", False)) and (temporal_module is not None)
+        if temporal_on:
+            temporal_param_ids = {id(p) for p in temporal_module.parameters()}
+            temporal_params = [p for p in temporal_module.parameters() if p.requires_grad]
+            base_params = [
+                p for p in self.model.parameters()
+                if p.requires_grad and (id(p) not in temporal_param_ids)
+            ]
+        else:
+            temporal_params = []
+            base_params = [p for p in self.model.parameters() if p.requires_grad]
+
         # Optimizer (abstract; two presets)
         if self.baseline == "avnerf":
             # 1:1 spirit of avnerf-trainer: Adam + warmup/exp decay inside train step
             lr = float(run_cfg.get("lr", 1e-3))
-            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
-            self._av_lr0 = lr
+            param_groups = [{"params": base_params, "lr": lr}]
+            if temporal_params:
+                param_groups.append({
+                    "params": temporal_params,
+                    "lr": lr * self.temporal_lr_mult,
+                    "name": "temporal_stack",
+                })
+            self.optimizer = torch.optim.Adam(param_groups)
+            self._main_lr0 = lr
         else:
             # NeRAF (ICLR ’25 impl details): Adam(β1=0.9, β2=0.999, eps=1e-15), lr 1e-4→1e-8 exp
-            self.optimizer = torch.optim.Adam(
-                self.model.parameters(), lr=1e-4,
-                betas=(0.9, 0.999), eps=1e-15
-            )
+            lr_hi = 1e-4
+            param_groups = [{"params": base_params, "lr": lr_hi}]
+            if temporal_params:
+                param_groups.append({
+                    "params": temporal_params,
+                    "lr": lr_hi * self.temporal_lr_mult,
+                    "name": "temporal_stack",
+                })
+            self.optimizer = torch.optim.Adam(param_groups, betas=(0.9, 0.999), eps=1e-15)
             # compute per-step decay factor to reach 1e-8 by last step
             self._neraf_lr_hi, self._neraf_lr_lo = 1e-4, 1e-8
             self._neraf_total_steps = None  # set on first train()
+
+        # Keep per-group base LR so schedules preserve temporal LR multiplier.
+        self._group_base_lrs = [float(g["lr"]) for g in self.optimizer.param_groups]
 
         self.visual_feat_builder = visual_feat_builder
         if ref_bank is None or ref_bank.numel() == 0:
@@ -418,19 +456,24 @@ class Trainer:
             # avnerf-trainer warmup 10% then exponential 0.1^(2 * progress)
             warmup = int(0.1 * max_epoch) * steps_per_epoch
             if step_idx < warmup:
-                lr = self._av_lr0 * (step_idx / max(1, warmup))
+                main_lr = self._main_lr0 * (step_idx / max(1, warmup))
             else:
                 total = max_epoch * steps_per_epoch
-                lr = self._av_lr0 * (0.1 ** (2 * (step_idx - warmup) / max(1, (total - warmup))))
-            self.optimizer.param_groups[0]["lr"] = lr
-            return lr
+                main_lr = self._main_lr0 * (0.1 ** (2 * (step_idx - warmup) / max(1, (total - warmup))))
+
+            ratio = main_lr / max(self._main_lr0, 1e-12)
+            for i, g in enumerate(self.optimizer.param_groups):
+                g["lr"] = self._group_base_lrs[i] * ratio
+            return self.optimizer.param_groups[0]["lr"]
         # NeRAF: per-step exponential from 1e-4 to 1e-8
         if self._neraf_total_steps is None:
             self._neraf_total_steps = max_epoch * steps_per_epoch
         t = step_idx / max(1, self._neraf_total_steps)
-        lr = self._neraf_lr_hi * ((self._neraf_lr_lo / self._neraf_lr_hi) ** t)
-        self.optimizer.param_groups[0]["lr"] = lr
-        return lr
+        main_lr = self._neraf_lr_hi * ((self._neraf_lr_lo / self._neraf_lr_hi) ** t)
+        ratio = main_lr / max(self._neraf_lr_hi, 1e-12)
+        for i, g in enumerate(self.optimizer.param_groups):
+            g["lr"] = self._group_base_lrs[i] * ratio
+        return self.optimizer.param_groups[0]["lr"]
 
     # inside Trainer class
     @staticmethod
@@ -585,6 +628,7 @@ class Trainer:
                 self.model.set_logger(wandb_run)  # NEW: let model/generator know about wandb
             pbar = tqdm(total=len(train_loader), desc=f"[train] epoch {epoch}", leave=False)
             for batch in train_loader:
+                lr = self._update_lr(step, len(train_loader), epochs, self.baseline)
                 # infer mode: slice batches carry 'stft_slice'
                 is_slice = ("stft_slice" in batch)
                 bs_obj = getattr(train_loader, "batch_sampler", None)
@@ -734,6 +778,14 @@ class Trainer:
                 total = total * self.loss_factor  # APPLY GLOBAL SCALE
                 self.optimizer.zero_grad(set_to_none=True)
                 total.backward()
+
+                grad_norm_preclip = None
+                if self.grad_clip_enabled:
+                    grad_norm_preclip = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        max_norm=self.grad_clip_max_norm,
+                        norm_type=self.grad_clip_norm_type,
+                    )
                 
                 # ================================
                 #   HARD DEBUG: LOSS WENT NaN
@@ -854,8 +906,6 @@ class Trainer:
                 
                 self.optimizer.step()
 
-                lr = self._update_lr(step, len(train_loader), epochs, self.baseline)
-
                 # ---- richer logging ----
                 parts_log = self._format_parts(parts, edc_val)
                 if wandb_run:
@@ -863,6 +913,8 @@ class Trainer:
                         "train/loss": float(total.item()),
                         "train/lr":   float(lr),
                     }
+                    if grad_norm_preclip is not None:
+                        wandb_log["train/grad_norm_preclip"] = float(grad_norm_preclip.item())
                     for k, v in parts_log.items():
                         wandb_log[f"train/{k}"] = v
 

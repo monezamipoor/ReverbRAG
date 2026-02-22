@@ -6,6 +6,12 @@ run:
   scene: FurnishedRoom        # e.g., EmptyRoom, FurnishedRoom
   sample_rate: 48000
   epochs: 100
+  lr: 1.0e-3
+  temporal_attention_lr_mult: 0.1   # multiplier for temporal stack LR (used only if temporal_attention.enabled=true)
+  grad_clip:
+    enabled: false
+    max_norm: 1.0
+    norm_type: 2.0
   save_root: ./checkpoints          # root for run folders
   save_every: 10              # save every N epochs
   resume:
@@ -53,7 +59,7 @@ databases:
 model:
 
   temporal_attention:
-    enabled: false        # when true, force sequence-style training batches
+    enabled: true        # when true, force sequence-style training batches
     causal: true          # each frame attends only to <= current frame
     n_layers: 2
     n_heads: 8
@@ -91,4 +97,4 @@ model:
   decoder:
     # empty list = single Linear(W, N_freq) per channel (old behaviour)
     # e.g. [2048, 1024] would give W -> 2048 -> 1024 -> N_freq
-    hidden: []
+    hidden: [1024, 1024]

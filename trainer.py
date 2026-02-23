@@ -1,47 +1,19 @@
 # trainer.py
 import math
-from copy import deepcopy
 import os
 from typing import Dict, Any, Optional, Tuple
 
-from decay_features import build_ref_decay_features_bank
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 # from torch.cuda.amp import autocast, GradScaler
 from tqdm.auto import tqdm
 from torchaudio.transforms import GriffinLim
 
 # local
 from evaluator import UnifiedEvaluator
+from losses import ReverbRAGLosses
+from decay_features import build_ref_decay_features_bank
 
-
-# ------------ small NeRAF-style losses (as you provided) ------------
-class SpectralConvergenceLoss(nn.Module):
-    def forward(self, x_mag, y_mag):
-        return torch.norm(y_mag - x_mag, p="fro") / (torch.norm(y_mag, p="fro") + 1e-12)
-
-class LogSTFTMagnitudeLoss(nn.Module):
-    def __init__(self, loss_type='l1'):
-        super().__init__()
-        self.loss_type = loss_type
-    def forward(self, x_log, y_log):
-        if self.loss_type == 'mse':
-            return F.mse_loss(x_log, y_log)
-        return F.l1_loss(x_log, y_log)
-
-class STFTLoss(nn.Module):
-    def __init__(self, loss_type='l1'):
-        super().__init__()
-        self.sc = SpectralConvergenceLoss()
-        self.lm = LogSTFTMagnitudeLoss(loss_type)
-    def forward(self, x_log, y_log):
-        x_mag = torch.exp(x_log) - 1e-3
-        y_mag = torch.exp(y_log) - 1e-3
-        return {'audio_sc_loss': self.sc(x_mag, y_mag),
-                'audio_mag_loss': self.lm(x_log, y_log)}
-
-# -------------------------------------------------------------------
 
 def fs_to_stft_params(fs: int):
     if fs == 48000:   # RAF default
@@ -135,67 +107,28 @@ class Trainer:
             print(f"{k:12s} : {v}")
         print("=============================================\n")
 
-        # NeRAF-style STFT loss (SC + log-mag)
-        mag_loss_type = loss_cfg.get("mag_loss_type", "mse")  # { "l1", "mse" }
-        self.mag_loss_type = str(mag_loss_type).lower()
-        self.loss_fn = STFTLoss(loss_type=self.mag_loss_type)
-
-        # Weights for each term
-        self.w_sc  = float(loss_cfg.get("sc", 0.0))   # spectral convergence
-        self.w_mag = float(loss_cfg.get("mag", 0.0))  # log-mag
-        self.w_mse = float(loss_cfg.get("mse", 0.0))  # extra log-mse
-        # Envelope + residual regularization
-        self.w_env_rms = float(loss_cfg.get("env_rms", 0.0))  # RMS envelope (log-domain, full STFT)
-        self.env_rms_loss_type = str(loss_cfg.get("env_rms_type", "l1"))  # {"l1","mse"}
-        self.w_res_l2  = float(loss_cfg.get("res_l2", 0.0))   # L2 penalty on residual log-STFT
-
-        # Optional early-time weighting for STFT losses (mag/mse only).
-        tw_cfg = loss_cfg.get("time_weight", {}) or {}
-        self.time_weight_enabled = bool(tw_cfg.get("enabled", False))
-        self.tw_early_frames = int(tw_cfg.get("early_frames", 12))
-        self.tw_early_gain = float(tw_cfg.get("early_gain", 2.0))
-        self.tw_normalize_mean = bool(tw_cfg.get("normalize_mean", True))
-        self.tw_apply_to_mag = bool(tw_cfg.get("apply_to_mag", True))
-        self.tw_apply_to_mse = bool(tw_cfg.get("apply_to_mse", True))
-        self.tw_max_frames = int(tw_cfg.get("max_frames", 60))
-
-        # Optional multi-resolution STFT waveform loss (using GT phase for ISTFT).
-        mr_cfg = loss_cfg.get("mrstft", {}) or {}
-        self.mrstft_enabled = bool(mr_cfg.get("enabled", False))
-        self.mrstft_weight = float(mr_cfg.get("weight", 0.0))
-        self.mrstft_loss_type = str(mr_cfg.get("loss_type", "l1")).lower()
-        self.mrstft_freq_focus = str(mr_cfg.get("freq_focus", "none")).lower()
-        self.mrstft_low_hz = float(mr_cfg.get("low_hz", 300.0))
-        self._warned_mrstft_skip = False
-        self.mrstft_scales = []
-        self._mr_windows = []
-        if self.mrstft_enabled and self.mrstft_weight > 0.0:
-            scales = mr_cfg.get("scales", None)
-            if not scales:
-                scales = [
-                    {"n_fft": 512,  "win_length": 256,  "hop_length": 128, "w": 1.0},
-                    {"n_fft": 1024, "win_length": 512,  "hop_length": 256, "w": 1.0},
-                    {"n_fft": 2048, "win_length": 1024, "hop_length": 512, "w": 1.2},
-                ]
-            for s in scales:
-                n_fft = int(s["n_fft"])
-                win_length = int(s.get("win_length", n_fft // 2))
-                hop_length = int(s.get("hop_length", max(1, win_length // 2)))
-                w = float(s.get("w", 1.0))
-                if win_length > n_fft:
-                    raise ValueError(f"mrstft scale invalid: win_length({win_length}) > n_fft({n_fft})")
-                self.mrstft_scales.append({
-                    "n_fft": n_fft,
-                    "win_length": win_length,
-                    "hop_length": hop_length,
-                    "w": w,
-                })
-                self._mr_windows.append(torch.hann_window(win_length, device=self.device, dtype=torch.float32))
-
-        # EDC weighting (support both new `losses.edc` and old `edc_loss`)
-        self.lambda_edc = float(
-            loss_cfg.get("edc", run_cfg.get("edc_loss", 0.0))
+        # All loss logic/config is delegated to losses.py
+        self.losses = ReverbRAGLosses(
+            loss_cfg=loss_cfg,
+            run_cfg=run_cfg,
+            fs=fs,
+            device=self.device,
+            base_n_fft=self._base_n_fft,
+            base_win_length=self._base_win_length,
+            base_hop_length=self._base_hop_length,
         )
+
+        # Expose a few fields for existing trainer flow.
+        self.lambda_edc = float(self.losses.lambda_edc)
+        self.edc_band_enabled = bool(self.losses.edc_band_enabled)
+        self.w_env_rms = float(self.losses.w_env_rms)
+        self.env_rms_loss_type = str(self.losses.env_rms_loss_type)
+        self.mrstft_enabled = bool(self.losses.mrstft_enabled)
+        self.mrstft_weight = float(self.losses.mrstft_weight)
+        self._warned_mrstft_skip = False
+        if self.edc_band_enabled and self.lambda_edc <= 0.0:
+            print("[warn] losses.edc_band.enabled=true but losses.edc<=0. "
+                  "edc_band is a modifier of EDC and has no effect unless edc>0.")
 
         # This flag is now basically informational; EDC behaviour is tied to lambda_edc
         self.use_edc_full = bool(
@@ -339,344 +272,32 @@ class Trainer:
 
         return pred
 
-    def _env_rms_loss(
-            self,
-            pred_env_log: torch.Tensor,   # [B, T_env] from envelope head (log_env_full)
-            gt_log:       torch.Tensor,   # [B, C, F, T] or [B, 1, F, T] log-mag STFT
-            loss_type:    str = "l1",
-        ) -> torch.Tensor:
-            """
-            Global RMS envelope supervision on FULL STFTs.
-            """
+    def _loss(self, pred_log, gt_log, slice_t: Optional[torch.Tensor] = None, is_slice: bool = False):
+        return self.losses.base_loss(
+            pred_log=pred_log,
+            gt_log=gt_log,
+            slice_t=slice_t,
+            is_slice=is_slice,
+            model_debug_outputs=getattr(self.model, "debug_outputs", None),
+        )
 
-            assert gt_log.shape[-1] == 60, "env_rms expects full GT STFT with T=60 frames"
+    def _env_rms_loss(self, pred_env_log: torch.Tensor, gt_log: torch.Tensor, loss_type: str = "l1") -> torch.Tensor:
+        return self.losses.env_rms_loss(pred_env_log=pred_env_log, gt_log=gt_log, loss_type=loss_type)
 
-            # compute GT log-RMS envelope from STFT (all in log domain at the end)
-            with torch.cuda.amp.autocast(enabled=False):
-                gt_log32 = gt_log.float()
-
-                mag_gt = (gt_log32.exp() - 1e-3).clamp_min(0.0)   # [B,C,F,T]
-
-                E_gt = (mag_gt ** 2).sum(dim=-2)                  # sum over F → [B,C,T] or [B,T]
-
-                if E_gt.dim() == 3:
-                    E_gt = E_gt.mean(dim=1)                      # average channels → [B,T]
-
-                rms_gt     = torch.sqrt(E_gt + 1e-8)              # [B,T]
-                log_rms_gt = torch.log(rms_gt + 1e-6)             # [B,T]
-
-            # enforce exact time AND batch alignment
-            B_pred, T_env = pred_env_log.shape
-            B_gt,   T_gt  = log_rms_gt.shape
-
-            if T_gt != T_env:
-                raise RuntimeError(
-                    f"env_rms loss: time length mismatch between pred_env_log (T_env={T_env}) "
-                    f"and GT log-RMS envelope (T={T_gt}). "
-                    "Fix the envelope head output length or the GT envelope computation; "
-                    "no implicit interpolation is performed."
-                )
-
-            if B_pred != B_gt:
-                raise RuntimeError(
-                    f"env_rms loss: batch mismatch between pred_env_log (B={B_pred}) "
-                    f"and GT log-RMS envelope (B={B_gt}). "
-                    "You probably passed per-slice envelopes instead of per-RIR envelopes, "
-                    "or your STFT batch size doesn't match geometry batch size."
-                )
-
-            if loss_type == "mse":
-                return F.mse_loss(pred_env_log, log_rms_gt)
-            elif loss_type == "l1":
-                return F.l1_loss(pred_env_log, log_rms_gt)
-            else:
-                raise ValueError(f"Unknown env_rms loss_type='{loss_type}'")
-
-
-
-    # ---- compact EDC loss (computed on full STFT batches only) ----
     def _edc_loss(
         self,
-        pred_log: torch.Tensor,   # [B, C, F, T] log-mag
-        gt_log:   torch.Tensor,
+        pred_log: torch.Tensor,
+        gt_log: torch.Tensor,
         valid_mask: Optional[torch.Tensor] = None,
         eps: float = 1e-8,
     ) -> torch.Tensor:
-        """
-        NeRAF-style EDC:
-          - magnitude = exp(log) - 1e-3
-          - per-frame energy: sum_f mag^2
-          - Schroeder integral over time
-          - L1 on log10 energy curves (no z-score, no 0 dB anchoring)
-        """
-        assert pred_log.shape[-1] == 60
-
-        with torch.cuda.amp.autocast(enabled=False):
-            pred_log32 = pred_log.float()
-            gt_log32   = gt_log.float()
-
-            # mag reconstruction identical to NeRAF
-            pred_mag = (pred_log32.exp() - 1e-3).clamp_min(0.0)
-            gt_mag   = (gt_log32.exp()   - 1e-3).clamp_min(0.0)
-
-            # energy per frame: sum over F, keep channels separate
-            # E: [B, C, T] or [B, T] if no channel dim
-            if pred_mag.dim() == 4:
-                E_pred = (pred_mag**2).sum(dim=-2)        # [B, C, T]
-                E_gt   = (gt_mag**2).sum(dim=-2)
-            else:
-                E_pred = (pred_mag**2).sum(dim=-2)        # [B, T]
-                E_gt   = (gt_mag**2).sum(dim=-2)
-
-            # Schroeder integral over time (last dim)
-            S_pred = torch.flip(torch.cumsum(torch.flip(E_pred, dims=[-1]), dim=-1), dims=[-1])
-            S_gt   = torch.flip(torch.cumsum(torch.flip(E_gt,   dims=[-1]), dim=-1), dims=[-1])
-
-            # log10 in energy domain (no 0 dB anchoring, no z-score)
-            s_pred = torch.log10(S_pred.clamp_min(eps))
-            s_gt   = torch.log10(S_gt  .clamp_min(eps))
-
-            # prepare mask
-            if valid_mask is not None:
-                # valid_mask: [B, T] -> broadcast to channels if needed
-                if s_pred.dim() == 3:  # [B, C, T]
-                    m = valid_mask.unsqueeze(1).to(s_pred.dtype)  # [B,1,T]
-                else:                   # [B, T]
-                    m = valid_mask.to(s_pred.dtype)
-            else:
-                m = torch.ones_like(s_pred, dtype=s_pred.dtype)
-
-            diff = (s_pred - s_gt) * m
-
-            # L1 over time (and channels if present), normalize by #valid
-            denom = m.sum(dim=tuple(range(1, s_pred.dim()))).clamp_min(1.0)  # [B]
-            per_b = diff.abs().sum(dim=tuple(range(1, s_pred.dim()))) / denom
-
-            return per_b.mean()
-        
-
-    def _make_time_weights(self, T: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """Build per-frame weights [T], boosting the first tw_early_frames."""
-        w = torch.ones(T, device=device, dtype=dtype)
-        if T <= 0:
-            return w
-        ef = max(0, min(int(self.tw_early_frames), int(T)))
-        if ef > 0 and self.tw_early_gain != 1.0:
-            w[:ef] = float(self.tw_early_gain)
-        if self.tw_normalize_mean:
-            w = w / w.mean().clamp_min(1e-12)
-        return w
-
-    @staticmethod
-    def _weighted_mean(err: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-        """
-        Weighted mean over all dimensions of err.
-        err: [B,C,F,T], w broadcastable to err (e.g., [1,1,1,T] or [B,1,1,1]).
-        """
-        w_exp = w.expand_as(err)
-        return (err * w_exp).sum() / w_exp.sum().clamp_min(1e-12)
-
-    def _loss(self, pred_log, gt_log, slice_t: Optional[torch.Tensor] = None, is_slice: bool = False):
-        pred_log = pred_log.float()
-        gt_log   = gt_log.float()
-
-        parts = {}
-        total = 0.0
-
-        time_w = None
-        if self.time_weight_enabled:
-            if is_slice:
-                if slice_t is None:
-                    raise RuntimeError("time_weight.enabled=True in slice mode but slice_t is missing.")
-                idx = slice_t.to(pred_log.device).long().view(-1)
-                base_w = self._make_time_weights(
-                    T=int(self.tw_max_frames),
-                    device=pred_log.device,
-                    dtype=pred_log.dtype,
-                )
-                idx = idx.clamp(0, base_w.shape[0] - 1)
-                # [B,1,1,1] to weight each slice-sample by its global time index.
-                time_w = base_w.index_select(0, idx).view(-1, 1, 1, 1)
-            else:
-                # [1,1,1,T] for full-sequence batches.
-                T_cur = int(pred_log.shape[-1])
-                time_w = self._make_time_weights(
-                    T=T_cur,
-                    device=pred_log.device,
-                    dtype=pred_log.dtype,
-                ).view(1, 1, 1, T_cur)
-
-        # ----- STFT-based losses -----
-        # Spectral convergence remains unweighted (global ratio over TF).
-        if self.w_sc != 0.0:
-            x_mag = torch.exp(pred_log) - 1e-3
-            y_mag = torch.exp(gt_log) - 1e-3
-            sc_val = self.loss_fn.sc(x_mag, y_mag)
-            parts["audio_sc_loss"] = sc_val
-            total = total + self.w_sc * sc_val
-
-        # Log-magnitude (L1/MSE), optionally early-time weighted.
-        if self.w_mag != 0.0:
-            if self.mag_loss_type == "mse":
-                mag_err = (pred_log - gt_log).pow(2)
-            else:
-                mag_err = (pred_log - gt_log).abs()
-            if self.time_weight_enabled and self.tw_apply_to_mag:
-                mag_val = self._weighted_mean(mag_err, time_w)
-            else:
-                mag_val = mag_err.mean()
-            parts["audio_mag_loss"] = mag_val
-            total = total + self.w_mag * mag_val
-
-        # ----- Extra log-MSE term (AV-NeRF-style), optionally early-time weighted -----
-        if self.w_mse != 0.0:
-            mse_err = (pred_log - gt_log).pow(2)
-            if self.time_weight_enabled and self.tw_apply_to_mse:
-                mse_val = self._weighted_mean(mse_err, time_w)
-            else:
-                mse_val = mse_err.mean()
-            parts["mse"] = mse_val
-            total = total + self.w_mse * mse_val
-            
-        # ----- Residual L2 regularization (envelope branch) -----
-        if self.w_res_l2 != 0.0:
-            dbg = getattr(self.model, "debug_outputs", None)
-            if isinstance(dbg, dict):
-                r_log = dbg.get("residual_log", None)
-                if r_log is not None:
-                    res_l2 = (r_log ** 2).mean()
-                    parts["res_l2"] = res_l2
-                    total = total + self.w_res_l2 * res_l2
-
-        # If you set all weights to 0.0, total == 0 and you’ve soft-bricked training.
-        return total, parts, None
-
-    @staticmethod
-    def _match_stft_timebins(x: torch.Tensor, T_target: int) -> torch.Tensor:
-        """
-        Match complex STFT time bins to target T by crop or repeat-last-frame pad.
-        x: [B,C,F,T_cur] complex
-        """
-        T_cur = int(x.shape[-1])
-        if T_cur == T_target:
-            return x
-        if T_cur > T_target:
-            return x[..., :T_target]
-        pad = T_target - T_cur
-        last = x[..., -1:].expand(*x.shape[:-1], pad)
-        return torch.cat([x, last], dim=-1)
+        return self.losses.edc_loss(pred_log=pred_log, gt_log=gt_log, valid_mask=valid_mask, eps=eps)
 
     def _reconstruct_wav_with_gt_phase(self, pred_log: torch.Tensor, gt_wav: torch.Tensor) -> torch.Tensor:
-        """
-        Reconstruct waveform from predicted log-mag using GT phase at base STFT params.
-        pred_log: [B,C,F,T]
-        gt_wav:   [B,Cg,Tw] (Cg may be 1)
-        returns:  [B,C,Tw]
-        """
-        pred_log = pred_log.float()
-        gt_wav = gt_wav.float()
-        B, C, F, T = pred_log.shape
-        B_w, Cg, Tw = gt_wav.shape
-        if B_w != B:
-            raise RuntimeError(f"mrstft: batch mismatch pred(B={B}) vs gt_wav(B={B_w}).")
-
-        # If GT wav has one channel but prediction has more, share phase across channels.
-        if Cg == 1 and C > 1:
-            gt_wav = gt_wav.expand(B, C, Tw)
-            Cg = C
-        if Cg != C:
-            raise RuntimeError(f"mrstft: channel mismatch pred(C={C}) vs gt_wav(C={Cg}).")
-
-        gt_flat = gt_wav.reshape(B * C, Tw)
-        base_window = torch.hann_window(self._base_win_length, device=gt_wav.device, dtype=gt_wav.dtype)
-        gt_c = torch.stft(
-            gt_flat,
-            n_fft=self._base_n_fft,
-            hop_length=self._base_hop_length,
-            win_length=self._base_win_length,
-            window=base_window,
-            center=True,
-            return_complex=True,
-        )  # [B*C,F,Tc]
-        gt_c = gt_c.view(B, C, gt_c.shape[-2], gt_c.shape[-1])
-        gt_c = self._match_stft_timebins(gt_c, T_target=T)
-        if gt_c.shape[-2] != F:
-            raise RuntimeError(f"mrstft: freq mismatch pred(F={F}) vs gt_phase(F={gt_c.shape[-2]}).")
-
-        phase_unit = gt_c / gt_c.abs().clamp_min(1e-8)
-        pred_mag = (pred_log.exp() - 1e-3).clamp_min(0.0)
-        pred_c = pred_mag.to(phase_unit.dtype) * phase_unit
-
-        pred_c_flat = pred_c.reshape(B * C, F, T)
-        wav_pred_flat = torch.istft(
-            pred_c_flat,
-            n_fft=self._base_n_fft,
-            hop_length=self._base_hop_length,
-            win_length=self._base_win_length,
-            window=base_window,
-            center=True,
-            length=Tw,
-        )  # [B*C,Tw]
-        return wav_pred_flat.view(B, C, Tw)
+        return self.losses.reconstruct_wav_with_gt_phase(pred_log=pred_log, gt_wav=gt_wav)
 
     def _mrstft_loss(self, wav_pred: torch.Tensor, wav_gt: torch.Tensor) -> torch.Tensor:
-        """
-        Multi-resolution STFT loss on waveforms.
-        wav_pred, wav_gt: [B,C,Tw]
-        """
-        if wav_pred.shape != wav_gt.shape:
-            raise RuntimeError(f"mrstft: wav shape mismatch {tuple(wav_pred.shape)} vs {tuple(wav_gt.shape)}")
-
-        B, C, Tw = wav_pred.shape
-        wp = wav_pred.reshape(B * C, Tw).float()
-        wg = wav_gt.reshape(B * C, Tw).float()
-
-        total = wp.new_zeros(())
-        wsum = 0.0
-        for sc, win in zip(self.mrstft_scales, self._mr_windows):
-            Xp = torch.stft(
-                wp,
-                n_fft=sc["n_fft"],
-                hop_length=sc["hop_length"],
-                win_length=sc["win_length"],
-                window=win,
-                center=True,
-                return_complex=True,
-            )
-            Xg = torch.stft(
-                wg,
-                n_fft=sc["n_fft"],
-                hop_length=sc["hop_length"],
-                win_length=sc["win_length"],
-                window=win,
-                center=True,
-                return_complex=True,
-            )
-
-            mp = Xp.abs().clamp_min(1e-8)
-            mg = Xg.abs().clamp_min(1e-8)
-            lp = torch.log(mp + 1e-6)
-            lg = torch.log(mg + 1e-6)
-            err = (lp - lg).abs() if self.mrstft_loss_type == "l1" else (lp - lg).pow(2)
-
-            if self.mrstft_freq_focus == "low":
-                n_freq = int(mp.shape[-2])
-                freqs = torch.linspace(
-                    0.0, self.fs / 2.0, steps=n_freq, device=err.device, dtype=err.dtype
-                )
-                mask = (freqs <= self.mrstft_low_hz).to(err.dtype).view(1, -1, 1)
-                # Keep baseline weight for all bins and emphasize low bins.
-                f_w = 1.0 + mask
-                err = err * f_w
-                err = err.sum() / f_w.expand_as(err).sum().clamp_min(1e-12)
-            else:
-                err = err.mean()
-
-            sw = float(sc["w"])
-            total = total + sw * err
-            wsum += sw
-
-        return total / max(wsum, 1e-12)
+        return self.losses.mrstft_loss(wav_pred=wav_pred, wav_gt=wav_gt)
 
 
     @staticmethod

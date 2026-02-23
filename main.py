@@ -50,14 +50,11 @@ def build_train_loader(cfg, dataset):
     loss_cfg = run_cfg.get("losses", {}) or {}
     model_cfg = cfg.get("model", {}) or {}
     ta_cfg = model_cfg.get("temporal_attention", {}) or {}
-    dec_cfg = model_cfg.get("decoder", {}) or {}
-    lf_global_cfg = dec_cfg.get("lf_global", {}) or {}
 
     # support both styles: run.losses.edc and legacy run.edc_loss
     edc_w = float(loss_cfg.get("edc", run_cfg.get("edc_loss", 0.0)))
     env_rms_w = float(loss_cfg.get("env_rms", 0.0))
     ta_enabled = bool(ta_cfg.get("enabled", False))
-    lf_global_enabled = bool(lf_global_cfg.get("enabled", False))
 
     # envelope_enabled = cfg["model"]["envelope"]["enabled"]
     shuffle      = bool(sc.get("shuffle", True))
@@ -68,7 +65,7 @@ def build_train_loader(cfg, dataset):
     total_slices = len(dataset)
     est_num_rirs = total_slices // T
 
-    if (edc_w > 0.0) or (env_rms_w > 0.0) or ta_enabled or lf_global_enabled:
+    if (edc_w > 0.0) or (env_rms_w > 0.0) or ta_enabled:
         # Sequence-required mode (EDC/env_rms/temporal attention): use RIRs-per-batch knob
         rpb = int(sc.get("rirs_per_batch", 40))
         bs_slices = rpb * T
@@ -90,8 +87,7 @@ def build_train_loader(cfg, dataset):
         steps = max(1, math.ceil(est_num_rirs / max(1, rpb)))
         print(f"[dataloader][TRAIN] mode=SLICE | sampler=EDCFullBatchSampler | T={T} | "
             f"rirs_per_batch={rpb} | bs={bs_slices} (slices) | workers={num_workers} | shuffle={shuffle} | "
-            f"reason: edc={edc_w > 0.0}, env_rms={env_rms_w > 0.0}, temporal_attention={ta_enabled}, "
-            f"lf_global_decoder={lf_global_enabled}")
+            f"reason: edc={edc_w > 0.0}, env_rms={env_rms_w > 0.0}, temporal_attention={ta_enabled}")
         print(f"[dataset][TRAIN] slices={total_slices} ≈ RIRs={est_num_rirs} | ~steps/epoch={steps}")
         return loader
 

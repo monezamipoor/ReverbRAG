@@ -490,10 +490,14 @@ class Trainer:
                 bs_obj = getattr(train_loader, "batch_sampler", None)
                 sampler_name = type(bs_obj).__name__ if bs_obj is not None else type(train_loader.sampler).__name__
                 temporal_on = bool(getattr(self.model, "use_temporal_attention", False))
+                lf_global_on = bool(getattr(self.model, "use_lf_global_decoder", False))
 
-                if is_slice and temporal_on:
+                if is_slice and (temporal_on or lf_global_on):
                     if sampler_name != "EDCFullBatchSampler":
-                        raise RuntimeError("temporal_attention requires EDCFullBatchSampler (grouped contiguous slices).")
+                        raise RuntimeError(
+                            "temporal_attention or decoder.lf_global requires "
+                            "EDCFullBatchSampler (grouped contiguous slices)."
+                        )
                     T = int(getattr(train_loader.dataset, "max_frames", 60))
                     fwd_batch = self._pack_grouped_slice_batch(batch, T=T)
 

@@ -8,6 +8,7 @@
 #     * AV-NeRF mode prefers per-pose features from dataset; still accepts 1024-D fallback.
 
 from dataclasses import dataclass, field
+import math
 from typing import Literal, Optional, Tuple
 
 from generator import ReverbRAGGenerator
@@ -220,16 +221,31 @@ class NeRAFDecoder(nn.Module):
         dir_cond_dim: int = 0,
         dropout_p: float = 0.0,
         head_hidden: Optional[list] = None,
+        lf_global_enabled: bool = False,
+        lf_bins: int = 0,
+        seq_len: int = 60,
+        lf_global_hidden: Optional[list] = None,
     ):
         super().__init__()
         self.n_channels = n_channels
         self.W = W
+        self.n_freq = n_freq
         self.dir_dim = dir_cond_dim
         self.use_dir = dir_cond_dim > 0
         self.p = dropout_p
 
         in_dim = W + dir_cond_dim if self.use_dir else W
         self.head_hidden = list(head_hidden) if head_hidden is not None else []
+        self.lf_global_enabled = bool(lf_global_enabled)
+        self.lf_bins = int(lf_bins) if self.lf_global_enabled else 0
+        self.seq_len = int(seq_len)
+        if self.lf_global_enabled:
+            if self.lf_bins <= 0:
+                raise ValueError(f"lf_global_enabled=True but lf_bins={self.lf_bins} (must be > 0).")
+            if self.lf_bins >= n_freq:
+                raise ValueError(f"lf_bins={self.lf_bins} must be < n_freq={n_freq}.")
+        self.hf_bins = n_freq - self.lf_bins if self.lf_global_enabled else n_freq
+        self.lf_global_hidden = list(lf_global_hidden) if lf_global_hidden is not None else []
 
         def _build_head(in_dim: int, out_dim: int) -> nn.Module:
             if not self.head_hidden:
@@ -243,7 +259,26 @@ class NeRAFDecoder(nn.Module):
             layers.append(nn.Linear(last, out_dim))
             return nn.Sequential(*layers)
 
-        self.heads = nn.ModuleList([_build_head(in_dim, n_freq) for _ in range(n_channels)])
+        self.heads = nn.ModuleList([_build_head(in_dim, self.hf_bins) for _ in range(n_channels)])
+
+        def _build_lf_head(in_dim_lf: int, out_dim_lf: int) -> nn.Module:
+            if not self.lf_global_hidden:
+                return nn.Linear(in_dim_lf, out_dim_lf)
+            layers = []
+            last = in_dim_lf
+            for h in self.lf_global_hidden:
+                layers.append(nn.Linear(last, h))
+                layers.append(nn.LeakyReLU(0.1, inplace=True))
+                last = h
+            layers.append(nn.Linear(last, out_dim_lf))
+            return nn.Sequential(*layers)
+
+        if self.lf_global_enabled:
+            lf_in_dim = self.seq_len * in_dim
+            lf_out_dim = self.lf_bins * self.seq_len
+            self.lf_heads = nn.ModuleList([_build_lf_head(lf_in_dim, lf_out_dim) for _ in range(n_channels)])
+        else:
+            self.lf_heads = None
 
     @staticmethod
     def mydropout(tensor: torch.Tensor, p: float = 0.0, training: bool = True) -> torch.Tensor:
@@ -267,6 +302,11 @@ class NeRAFDecoder(nn.Module):
         B, T, W = w_tokens.shape
         assert W == self.W, "Token width mismatch"
         w = w_tokens.reshape(B * T, W)
+        if self.lf_global_enabled and T != self.seq_len:
+            raise RuntimeError(
+                f"LF-global decoder expects T={self.seq_len}, got T={T}. "
+                "Use full-sequence batches (grouped by RIR) and set decoder.lf_global.seq_len correctly."
+            )
 
         if self.use_dir:
             if dir_cond is None:
@@ -285,11 +325,21 @@ class NeRAFDecoder(nn.Module):
         else:
             dec_in = w  # NeRAF path unchanged
 
+        dec_in_bt = dec_in.view(B, T, -1)
+        lf_in = dec_in_bt.reshape(B, -1) if self.lf_global_enabled else None
+
         outs = []
-        for head in self.heads:
-            f_flat = head(dec_in)                 # [B*T, F]
-            f_flat = torch.tanh(f_flat) * 10
-            f = f_flat.view(B, T, -1).transpose(1, 2)  # [B, F, T]
+        for ch, head in enumerate(self.heads):
+            hf_flat = head(dec_in)                 # [B*T, F_hf]
+            hf_flat = torch.tanh(hf_flat) * 10
+            hf = hf_flat.view(B, T, -1).transpose(1, 2)  # [B, F_hf, T]
+            if self.lf_global_enabled:
+                lf_flat = self.lf_heads[ch](lf_in)            # [B, lf_bins * T]
+                lf_flat = torch.tanh(lf_flat) * 10
+                lf = lf_flat.view(B, self.seq_len, self.lf_bins).transpose(1, 2)  # [B, lf_bins, T]
+                f = torch.cat([lf, hf], dim=1)                # [B, F, T]
+            else:
+                f = hf
             outs.append(f.unsqueeze(1))           # [B,1,F,T]
         return torch.cat(outs, dim=1)             # [B, C, F, T]
 
@@ -419,6 +469,7 @@ class UnifiedReverbRAGModel(nn.Module):
         neraf_enc_hidden  = list(enc_neraf_cfg.get("hidden", [5096, 2048, 1024]))
         avnerf_enc_hidden = list(enc_av_cfg.get("hidden", [5096, 2048, 1024, 1024]))
         dec_head_hidden   = list(dec_cfg.get("hidden", []))
+        lf_global_cfg = (dec_cfg.get("lf_global", {}) or {})
 
         # Shared SH for direction (used in c and in decoder for AV-NeRF)
         self.rot_encoding = SHEncoding(levels=4, implementation="tcnn")
@@ -449,12 +500,30 @@ class UnifiedReverbRAGModel(nn.Module):
         else:
             raise ValueError(f"Unknown baseline {cfg.baseline}")
 
+        lf_global_enabled = bool(lf_global_cfg.get("enabled", False))
+        lf_seq_len = int(lf_global_cfg.get("seq_len", 60))
+        lf_global_hidden = list(lf_global_cfg.get("hidden", []))
+        lf_bins_cfg = lf_global_cfg.get("lf_bins", None)
+        lf_max_hz = float(lf_global_cfg.get("lf_max_hz", 300.0))
+        if lf_bins_cfg is None:
+            n_fft = (self.N_freq - 1) * 2
+            hz_per_bin = float(cfg.sample_rate) / float(n_fft)
+            lf_bins = int(math.floor(lf_max_hz / max(hz_per_bin, 1e-12))) + 1
+        else:
+            lf_bins = int(lf_bins_cfg)
+        lf_bins = max(1, min(self.N_freq - 1, lf_bins))
+        self.use_lf_global_decoder = lf_global_enabled
+
         self.decoder = NeRAFDecoder(
             W=cfg.W_field,
             n_freq=self.N_freq,
             n_channels=self.n_channels,
             dir_cond_dim=dir_cond_dim,
             head_hidden=dec_head_hidden,
+            lf_global_enabled=lf_global_enabled,
+            lf_bins=lf_bins,
+            seq_len=lf_seq_len,
+            lf_global_hidden=lf_global_hidden,
         )
 
         self.use_rag = rag_cfg.get("enabled", False)

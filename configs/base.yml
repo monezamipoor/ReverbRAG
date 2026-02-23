@@ -123,3 +123,12 @@ model:
     # empty list = single Linear(W, N_freq) per channel (old behaviour)
     # e.g. [2048, 1024] would give W -> 2048 -> 1024 -> N_freq
     hidden: []
+    # Optional low-frequency global decoder branch:
+    # predicts first lf_bins (or bins up to lf_max_hz) for all frames jointly.
+    lf_global:
+      enabled: false
+      # Pick one: set lf_bins directly, or leave null and use lf_max_hz.
+      lf_bins: null
+      lf_max_hz: 300.0
+      seq_len: 60
+      hidden: []   # empty -> single Linear over flattened [T x (W+dir)]

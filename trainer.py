@@ -531,7 +531,26 @@ class Trainer:
                             wav = None
                     else:
                         pred_full = pred
-                        wav = batch["wav"].to(self.device).float()  # [B,1,Tw] on RAF
+                        wav = batch["wav"].to(self.device).float()  # usually [B,1,Tw]
+                        # If forward path packed grouped slices to full RIRs (e.g., temporal-attn path),
+                        # "batch" is still the original slice batch and wav is [B*T,1,Tw].
+                        # Pack wav to [B,1,Tw] so it matches pred_full batch size.
+                        if wav.shape[0] != pred_full.shape[0]:
+                            T = int(getattr(train_loader.dataset, "max_frames", 60))
+                            if (wav.shape[0] % T) == 0:
+                                B_full = wav.shape[0] // T
+                                if B_full == pred_full.shape[0]:
+                                    wav = wav.view(B_full, T, wav.shape[1], wav.shape[2])[:, 0, ...]
+                                else:
+                                    raise RuntimeError(
+                                        "mrstft: packed wav batch does not match pred batch after grouped-slice "
+                                        f"forward (pred B={pred_full.shape[0]}, wav B={B_full}, T={T})."
+                                    )
+                            else:
+                                raise RuntimeError(
+                                    "mrstft: wav batch size mismatch and cannot pack with dataset max_frames. "
+                                    f"pred B={pred_full.shape[0]}, wav B={wav.shape[0]}, T={T}"
+                                )
 
                     if pred_full is not None and wav is not None:
                         wav_pred = self._reconstruct_wav_with_gt_phase(pred_full, wav)

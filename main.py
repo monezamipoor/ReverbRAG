@@ -19,6 +19,7 @@ from tqdm.auto import tqdm
 from data import build_dataset
 from dataloader import RandomSliceBatchSampler, EDCFullBatchSampler
 from model import UnifiedReverbRAGModel, ModelConfig
+from global_models import GlobalDualBranchModel, GlobalSeq2SeqUpscaleModel
 from trainer import Trainer, fs_to_stft_params
 
 # --------- small utils ----------
@@ -48,6 +49,7 @@ def build_train_loader(cfg, dataset):
     sc = copy.deepcopy(cfg.get("sampler", {}))
     run_cfg = cfg.get("run", {}) or {}
     loss_cfg = run_cfg.get("losses", {}) or {}
+    model_family = str(run_cfg.get("model_family", "unified")).lower()
     model_cfg = cfg.get("model", {}) or {}
     ta_cfg = model_cfg.get("temporal_attention", {}) or {}
 
@@ -55,6 +57,8 @@ def build_train_loader(cfg, dataset):
     edc_w = float(loss_cfg.get("edc", run_cfg.get("edc_loss", 0.0)))
     env_rms_w = float(loss_cfg.get("env_rms", 0.0))
     ta_enabled = bool(ta_cfg.get("enabled", False))
+    global_dual_branch = (model_family == "global_dual_branch")
+    global_seq2seq = (model_family == "global_seq2seq_upscale")
 
     # envelope_enabled = cfg["model"]["envelope"]["enabled"]
     shuffle      = bool(sc.get("shuffle", True))
@@ -65,7 +69,7 @@ def build_train_loader(cfg, dataset):
     total_slices = len(dataset)
     est_num_rirs = total_slices // T
 
-    if (edc_w > 0.0) or (env_rms_w > 0.0) or ta_enabled:
+    if (edc_w > 0.0) or (env_rms_w > 0.0) or ta_enabled or global_dual_branch or global_seq2seq:
         # Sequence-required mode (EDC/env_rms/temporal attention): use RIRs-per-batch knob
         rpb = int(sc.get("rirs_per_batch", 40))
         bs_slices = rpb * T
@@ -87,7 +91,9 @@ def build_train_loader(cfg, dataset):
         steps = max(1, math.ceil(est_num_rirs / max(1, rpb)))
         print(f"[dataloader][TRAIN] mode=SLICE | sampler=EDCFullBatchSampler | T={T} | "
             f"rirs_per_batch={rpb} | bs={bs_slices} (slices) | workers={num_workers} | shuffle={shuffle} | "
-            f"reason: edc={edc_w > 0.0}, env_rms={env_rms_w > 0.0}, temporal_attention={ta_enabled}")
+            f"reason: edc={edc_w > 0.0}, env_rms={env_rms_w > 0.0}, "
+            f"temporal_attention={ta_enabled}, global_dual_branch={global_dual_branch}, "
+            f"global_seq2seq={global_seq2seq}")
         print(f"[dataset][TRAIN] slices={total_slices} ≈ RIRs={est_num_rirs} | ~steps/epoch={steps}")
         return loader
 
@@ -191,6 +197,7 @@ def main():
     # Run config
     run = cfg.get("run", {})
     baseline = run.get("model", "neraf").lower()          # {neraf|avnerf}
+    model_family = run.get("model_family", "unified").lower()  # {unified|global_dual_branch|global_seq2seq_upscale}
     database = run.get("database", "raf").lower()         # {raf|soundspaces}
     scene = run.get("scene", "FurnishedRoom")
     fs = int(run.get("sample_rate", 48000))
@@ -258,7 +265,15 @@ def main():
         opt=cfg.get("model", {}),
     )
 
-    model = UnifiedReverbRAGModel(mcfg).to(device)
+    if model_family == "global_dual_branch":
+        model = GlobalDualBranchModel(mcfg).to(device)
+        print("[model] using GlobalDualBranchModel")
+    elif model_family == "global_seq2seq_upscale":
+        model = GlobalSeq2SeqUpscaleModel(mcfg).to(device)
+        print("[model] using GlobalSeq2SeqUpscaleModel")
+    else:
+        model = UnifiedReverbRAGModel(mcfg).to(device)
+        print("[model] using UnifiedReverbRAGModel")
 
     # --------- Trainer ----------
     stft_params = fs_to_stft_params(fs)

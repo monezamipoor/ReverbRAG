@@ -1,7 +1,7 @@
 seed: 42
 
 run:
-  model_family: global_seq2seq_upscale        # {unified | global_dual_branch | global_seq2seq_upscale}
+  model_family: global_dual_branch        # {unified | global_dual_branch | global_seq2seq_upscale}
   model: avnerf                # {neraf | avnerf}
   database: raf               # {raf | soundspaces}
   scene: FurnishedRoom        # e.g., EmptyRoom, FurnishedRoom
@@ -10,7 +10,7 @@ run:
   lr: 1.0e-3
   temporal_attention_lr_mult: 0.1   # multiplier for temporal stack LR (used only if temporal_attention.enabled=true)
   grad_clip:
-    enabled: false
+    enabled: true
     max_norm: 1.0
     norm_type: 2.0
   save_root: ./checkpoints          # root for run folders
@@ -107,7 +107,7 @@ model:
       dropout: 0.05
 
   global_dual_branch:
-    enabled: false
+    enabled: true
     global_encoder:
       hidden: [2048, 1024, 1024]
       out_dim: 1024
@@ -131,7 +131,7 @@ model:
       token_layernorm: true
 
   temporal_attention:
-    enabled: false        # when true, force sequence-style training batches
+    enabled: true        # used by unified model and (now) HF branch of global_dual_branch
     causal: true          # each frame attends only to <= current frame
     n_layers: 2
     n_heads: 8

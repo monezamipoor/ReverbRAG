@@ -490,10 +490,14 @@ class Trainer:
                 bs_obj = getattr(train_loader, "batch_sampler", None)
                 sampler_name = type(bs_obj).__name__ if bs_obj is not None else type(train_loader.sampler).__name__
                 temporal_on = bool(getattr(self.model, "use_temporal_attention", False))
+                needs_packed = bool(getattr(self.model, "requires_packed_sequence", False))
 
-                if is_slice and temporal_on:
+                if is_slice and (temporal_on or needs_packed):
                     if sampler_name != "EDCFullBatchSampler":
-                        raise RuntimeError("temporal_attention requires EDCFullBatchSampler (grouped contiguous slices).")
+                        raise RuntimeError(
+                            "This model configuration requires EDCFullBatchSampler "
+                            "(grouped contiguous slices per RIR)."
+                        )
                     T = int(getattr(train_loader.dataset, "max_frames", 60))
                     fwd_batch = self._pack_grouped_slice_batch(batch, T=T)
 

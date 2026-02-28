@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.field_components.encodings import NeRFEncoding, SHEncoding
+from model import TemporalCausalStack
 
 
 def fs_to_stft_params(fs: int):
@@ -91,6 +92,7 @@ class GlobalDualBranchModel(nn.Module):
         self.T_default = 60
 
         # Keep trainer compatibility.
+        self.requires_packed_sequence = True
         self.use_temporal_attention = False
         self.temporal_stack = None
         self.rag_gen = None
@@ -184,6 +186,19 @@ class GlobalDualBranchModel(nn.Module):
             dropout=hf_drop,
             out_act=False,
         )
+
+        # Optional temporal attention over HF tokens.
+        ta_cfg = cfg.opt.get("temporal_attention", {}) or {}
+        self.use_temporal_attention = bool(ta_cfg.get("enabled", False))
+        if self.use_temporal_attention:
+            self.temporal_stack = TemporalCausalStack(
+                d_model=hf_token_dim,
+                n_layers=int(ta_cfg.get("n_layers", 2)),
+                n_heads=int(ta_cfg.get("n_heads", 8)),
+                dropout=float(ta_cfg.get("dropout", 0.1)),
+                ff_mult=int(ta_cfg.get("ff_mult", 4)),
+                causal=bool(ta_cfg.get("causal", True)),
+            )
 
     def set_logger(self, logger):
         self._logger = logger
@@ -279,6 +294,8 @@ class GlobalDualBranchModel(nn.Module):
 
         # HF branch: time-conditioned
         h = self._hf_tokens(g1, t_idx)  # [B,T,D]
+        if self.use_temporal_attention:
+            h = self.temporal_stack(h)
         hf_flat = self.hf_decoder(h.reshape(B * T, -1))  # [B*T, C*n_hf_pred]
         hf = hf_flat.view(B, T, self.n_channels, self.n_hf_pred).permute(0, 2, 3, 1).contiguous()
         hf = torch.tanh(hf) * 10.0
@@ -420,6 +437,15 @@ class GlobalSeq2SeqUpscaleModel(nn.Module):
             dropout=up_drop,
             out_act=False,
         )
+        # Expose seq2seq-heavy modules through temporal_stack so existing trainer
+        # LR multiplier (temporal_attention_lr_mult) applies to this architecture too.
+        self.temporal_stack = nn.ModuleList([
+            self.global_encoder,
+            self.encoder,
+            self.decoder,
+            self.low_head,
+            self.upscaler,
+        ])
 
     def set_logger(self, logger):
         self._logger = logger

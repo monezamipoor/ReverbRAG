@@ -274,16 +274,24 @@ def measure_edt(h, fs=44100, decay_db=10):
     power = h ** 2
     energy = np.cumsum(power[::-1])[::-1]  # Integration according to Schroeder
 
-    # remove the possibly all zero tail
+    # remove all-zero / non-finite tails
     if np.all(energy == 0):
         return np.nan
 
-    i_nz = np.max(np.where(energy > 0)[0])
-    energy = energy[:i_nz]
+    nz = np.where(np.isfinite(energy) & (energy > 0))[0]
+    if nz.size == 0:
+        return np.nan
+    i_nz = int(np.max(nz))
+    energy = energy[: i_nz + 1]
+    if energy.size == 0:
+        return np.nan
     energy_db = 10 * np.log10(energy)
     energy_db -= energy_db[0]
 
-    i_decay = np.min(np.where(- decay_db - energy_db > 0)[0])
+    decay_idx = np.where((-decay_db - energy_db) > 0)[0]
+    if decay_idx.size == 0:
+        return np.nan
+    i_decay = int(np.min(decay_idx))
     t_decay = i_decay / fs
     # compute the decay time
     decay_time = t_decay

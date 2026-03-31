@@ -250,33 +250,6 @@ class RAFDataset(Dataset):
             if edc_mm is not None:
                 return torch.from_numpy(edc_mm[row].astype(np.float32))
         return torch.empty(0)
-    # # -------- Online fetchers (no memmaps) --------
-    # def _mm_fetch_stft(self, sid: str) -> torch.Tensor:
-    #     """
-    #     Return [1, F, max_frames] log-magnitude STFT tensor,
-    #     computed on the fly from the raw RIR.
-    #     """
-    #     wav = self._load_wav(sid)  # [1, T]
-    #     stft_logmag = compute_rir_stft_logmag(
-    #         self.stft, wav, max_frames=self.max_frames
-    #     )  # [1, F, max_frames]
-    #     return stft_logmag
-
-    # def _mm_fetch_edc(self, sid: str) -> torch.Tensor:
-    #     """
-    #     Return [max_frames] EDC(dB) curve computed on the fly.
-    #     If you don't need EDC, you can make this return an empty tensor.
-    #     """
-    #     # If you want to completely disable EDC, just uncomment this:
-    #     # return torch.empty(0)
-
-    #     wav = self._load_wav(sid)  # [1, T]
-    #     edc = compute_edc_curve_from_wav(
-    #         wav, T_target=self.max_frames
-    #     )  # [max_frames]
-    #     return edc
-
-    # -----------------------------------
 
     def _slice_from_wav(self, wav: torch.Tensor, t: int):
         start = int(t * self.hop)

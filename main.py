@@ -36,7 +36,6 @@ def _worker_init_fn(_):
         try: info.dataset._cache.clear()
         except Exception: info.dataset._cache = {}
 
-# --- add these helper builders somewhere above main() ---
 
 def build_train_loader(cfg, dataset):
     """
